@@ -1,21 +1,72 @@
-MIT License
+gitscout — Proprietary Software License
+Copyright (c) 2026 Ayushkumarsinghyogesh. All rights reserved.
 
-Copyright (c) 2026 Ayushkumarsinghyogesh
+This source code is made publicly viewable for evaluation, reference and
+transparency only. It is NOT open source, and no open-source licence applies
+to it.
 
-Permission is hereby granted, free of charge, to any person obtaining a copy
-of this software and associated documentation files (the "Software"), to deal
-in the Software without restriction, including without limitation the rights
-to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
-copies of the Software, and to permit persons to whom the Software is
-furnished to do so, subject to the following conditions:
+1. GRANT
 
-The above copyright notice and this permission notice shall be included in all
-copies or substantial portions of the Software.
+   You are permitted to:
 
-THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
-IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
-FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
-AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
-LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
-OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
-SOFTWARE.
+   (a) view and read this source code;
+   (b) clone or fork this repository solely to evaluate it, for a period of up
+       to thirty (30) days; and
+   (c) run it unmodified, on data you are lawfully entitled to process, solely
+       to evaluate it during that same period.
+
+2. RESTRICTIONS
+
+   Except as expressly permitted in Section 1, or with the prior written
+   permission of the copyright holder, you may NOT:
+
+   (a) use this software, in whole or in part, for any commercial purpose, or
+       in the operation of any business or revenue-generating activity;
+   (b) copy, reproduce, publish, distribute, sublicense, sell, rent, lease or
+       otherwise transfer this software or any part of it;
+   (c) modify, adapt, translate or create derivative works from it;
+   (d) incorporate it, or any portion of it, into another product, service,
+       repository or model training corpus;
+   (e) remove, obscure or alter any copyright, licence or attribution notice;
+       or
+   (f) use the name "gitscout" or the copyright holder's name to endorse or
+       promote any product without written permission.
+
+3. COMMERCIAL LICENCE
+
+   A commercial licence, which may permit production use, modification and
+   redistribution, is available separately. To request one, contact the
+   copyright holder through the repository's GitHub profile.
+
+4. THIRD-PARTY COMPONENTS
+
+   This software depends on third-party packages (including httpx, typer and
+   python-dotenv) that are distributed under their own permissive licences.
+   Those licences govern those components, not this one, and nothing in this
+   licence restricts your rights in them.
+
+5. NO WARRANTY
+
+   THIS SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+   IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+   FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT.
+
+6. LIMITATION OF LIABILITY
+
+   IN NO EVENT SHALL THE COPYRIGHT HOLDER BE LIABLE FOR ANY CLAIM, DAMAGES OR
+   OTHER LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE,
+   ARISING FROM, OUT OF OR IN CONNECTION WITH THIS SOFTWARE OR ITS USE.
+
+7. TERMINATION
+
+   Any use of this software outside the permissions in Section 1 terminates
+   this licence automatically and immediately, without notice.
+
+8. RESPONSIBLE USE
+
+   This software collects personal data that individuals have published
+   publicly. Your use of it is subject to GitHub's Terms of Service and to
+   applicable data-protection and anti-spam law, including the GDPR, the UK
+   PECR, the US CAN-SPAM Act and India's DPDP Act. You alone are responsible
+   for the lawfulness of your use. See the "Responsible use" section of
+   README.md.
