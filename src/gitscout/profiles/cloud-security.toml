@@ -1,0 +1,125 @@
+# Complementary open-source cloud security tools.
+#
+# These are the repos whose users are most likely to care about a cloud security
+# product: people who star Prowler or file an issue on Checkov have already told you
+# what problem they are working on.
+#
+# `kinds` defaults to all six signals: stars, forks, issues, prs, discussions, contribs.
+# Narrow it per repo when a repo is so large that stars are mostly noise -- see the note
+# on kubernetes-sigs/kubespray below. `contribs` reads the default-branch commit history,
+# which is the most expensive signal to backfill on a very active repo; bound the first
+# run with --max.
+# `weight` is reserved for downstream prioritisation; it does not change crawling.
+#
+# Run it with:  gitscout scout --targets targets/cloud-security.toml
+
+name = "cloud-security"
+description = "CSPM, IaC scanning, container & k8s security, secret detection"
+
+# --- Cloud security posture management -------------------------------------------
+[[target]]
+repo = "prowler-cloud/prowler"
+note = "CSPM for AWS/Azure/GCP/K8s - the closest comparable audience"
+weight = 1.0
+
+[[target]]
+repo = "aquasecurity/cloudsploit"
+note = "Cloud security scanning (Aqua)"
+
+[[target]]
+repo = "nccgroup/ScoutSuite"
+note = "Multi-cloud security auditing"
+
+[[target]]
+repo = "cloud-custodian/cloud-custodian"
+note = "Cloud governance as code"
+
+[[target]]
+repo = "turbot/steampipe"
+note = "Query cloud config as SQL"
+
+[[target]]
+repo = "cloudquery/cloudquery"
+note = "Cloud asset inventory ETL"
+
+# --- Infrastructure-as-code scanning ----------------------------------------------
+[[target]]
+repo = "bridgecrewio/checkov"
+note = "IaC static analysis - high-intent audience"
+weight = 1.0
+
+[[target]]
+repo = "aquasecurity/tfsec"
+note = "Terraform security scanner (now folded into Trivy)"
+
+[[target]]
+repo = "tenable/terrascan"
+note = "IaC policy scanning"
+
+[[target]]
+repo = "Checkmarx/kics"
+note = "IaC misconfiguration scanning"
+
+[[target]]
+repo = "terraform-linters/tflint"
+note = "Terraform linting - adjacent, more DevOps than security"
+weight = 0.7
+
+# --- Container & Kubernetes security -----------------------------------------------
+[[target]]
+repo = "aquasecurity/trivy"
+note = "Container/IaC/SBOM scanner - very large, stars are noisier"
+weight = 0.8
+
+[[target]]
+repo = "falcosecurity/falco"
+note = "Runtime security for containers and K8s"
+
+[[target]]
+repo = "aquasecurity/kube-bench"
+note = "CIS benchmark for Kubernetes"
+
+[[target]]
+repo = "kubescape/kubescape"
+note = "K8s security posture"
+
+[[target]]
+repo = "open-policy-agent/opa"
+note = "Policy engine - broad audience, weight accordingly"
+weight = 0.7
+
+[[target]]
+repo = "open-policy-agent/gatekeeper"
+note = "OPA admission control for K8s"
+
+# --- Secret detection ---------------------------------------------------------------
+[[target]]
+repo = "gitleaks/gitleaks"
+note = "Secret scanning in git history"
+
+[[target]]
+repo = "trufflesecurity/trufflehog"
+note = "Secret detection and verification"
+
+# --- SAST / supply chain ------------------------------------------------------------
+[[target]]
+repo = "semgrep/semgrep"
+note = "Static analysis - large, partially adjacent"
+weight = 0.7
+
+[[target]]
+repo = "anchore/syft"
+note = "SBOM generation"
+
+[[target]]
+repo = "anchore/grype"
+note = "Vulnerability scanning from SBOMs"
+
+# --- Deliberately narrowed ----------------------------------------------------------
+# Huge general-infra repos: a star says 'I do infra', not 'I have a security budget',
+# so only take the high-intent signals.
+[[target]]
+repo = "kubernetes-sigs/kubespray"
+kinds = ["issues", "prs", "contribs"]
+note = "High-intent signals only - stars are too broad here"
+weight = 0.5

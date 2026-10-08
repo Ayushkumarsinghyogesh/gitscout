@@ -1,0 +1,12 @@
+.env
+*.db
+*.db-wal
+*.db-shm
+*.csv
+*.jsonl
+out/
+state/
+__pycache__/
+*.egg-info/
+.venv/
+.pytest_cache/

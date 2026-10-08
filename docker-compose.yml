@@ -1,0 +1,42 @@
+# docker compose up -d        # start the scheduler
+# docker compose logs -f      # watch it work
+# docker compose run --rm gitscout gitscout doctor        # one-off commands
+# docker compose run --rm gitscout gitscout stats
+services:
+  gitscout:
+    build: .
+    image: gitscout:0.2.0
+    container_name: gitscout
+    restart: unless-stopped
+    env_file:
+      - .env
+    environment:
+      GITSCOUT_DB: /data/gitscout.db
+      # Tuning knobs (see .env.example for the full list)
+      GITSCOUT_COMMIT_BATCH: "10"
+    volumes:
+      # Named volume: the SQLite database is the state that makes runs incremental,
+      # so losing it means the next run re-backfills (safe, just slower).
+      - gitscout-data:/data
+      # Leads also land here so you can pick them up from the host.
+      - ./out:/data/out
+    command:
+      - gitscout
+      - watch
+      - --targets
+      - cloud-security
+      - --every
+      - 6h
+      - --out
+      - /data/out/new-leads.csv
+      - --out
+      - /data/out/new-leads.jsonl
+      - --only-with-email
+    # SQLite plus a handful of concurrent HTTP calls needs very little.
+    deploy:
+      resources:
+        limits:
+          memory: 512M
+
+volumes:
+  gitscout-data:

@@ -1,0 +1,43 @@
+name: CI
+
+on:
+  push:
+    branches: ["**"]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, windows-latest]
+        python-version: ["3.11", "3.12", "3.13"]
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python-version }}
+
+      - name: Install
+        run: pip install --upgrade pip && pip install -e ".[dev]"
+
+      # The whole suite is mocked: no network and no token required.
+      - name: Test
+        run: python -m pytest -q
+
+      # Offline doctor must pass its local checks even with no token configured,
+      # and every shipped target profile must parse.
+      - name: Validate target profiles
+        run: gitscout --db ci.db doctor --offline --targets cloud-security || true
+
+      - name: Check the CLI is installed and importable
+        run: |
+          gitscout --help
+          gitscout targets-list

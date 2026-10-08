@@ -1,0 +1,117 @@
+# Scheduled lead collection, free on GitHub-hosted runners.
+#
+# Setup (one time):
+#   1. Settings -> Secrets and variables -> Actions -> New repository secret
+#      Name: GITSCOUT_GITHUB_TOKENS   Value: ghp_xxx  (comma-separate several)
+#      Do NOT rely on the built-in GITHUB_TOKEN: in Actions it is capped at 1,000
+#      GraphQL points per repository, and it cannot read user profile emails.
+#   2. Actions -> Scout -> Run workflow, to check it before the cron takes over.
+#
+# Each run is incremental: it reads only what appeared since the last run, so a
+# 6-hourly schedule costs a few GraphQL points per repo.
+name: Scout
+
+on:
+  schedule:
+    # 02:00 and 14:00 UTC. Avoid the top of the hour: that is when every cron fires.
+    - cron: "7 2,14 * * *"
+  workflow_dispatch:
+    inputs:
+      targets:
+        description: "Target profile name or path"
+        default: "cloud-security"
+        type: string
+      backfill:
+        description: "Full backfill instead of an incremental run (slow, first time only)"
+        default: false
+        type: boolean
+      max_items:
+        description: "Soft cap per repo+kind (0 = unlimited)"
+        default: "0"
+        type: string
+
+permissions:
+  contents: read
+
+concurrency:
+  # Never let two runs touch the same database.
+  group: gitscout-scout
+  cancel-in-progress: false
+
+jobs:
+  scout:
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    env:
+      GITHUB_TOKENS: ${{ secrets.GITSCOUT_GITHUB_TOKENS }}
+      GITSCOUT_DB: ${{ github.workspace }}/state/gitscout.db
+      # Optional: set these secrets to enable paid enrichment. Absent = disabled.
+      HUNTER_API_KEY: ${{ secrets.HUNTER_API_KEY }}
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install
+        run: pip install --upgrade pip && pip install -e .
+
+      # The database carries the high-water marks that make runs incremental.
+      # A cache miss is safe (the run just re-backfills) but costs more points, so
+      # the restore-keys prefix picks up the most recent cache available.
+      - name: Restore state
+        id: restore
+        uses: actions/cache/restore@v4
+        with:
+          path: state
+          key: gitscout-db-${{ github.run_id }}
+          restore-keys: |
+            gitscout-db-
+
+      - name: Preflight
+        run: |
+          mkdir -p state out
+          gitscout doctor --targets "${{ inputs.targets || 'cloud-security' }}"
+
+      - name: Scout
+        run: |
+          gitscout scout \
+            --targets "${{ inputs.targets || 'cloud-security' }}" \
+            ${{ inputs.backfill == true && ' ' || '--incremental --new-only' }} \
+            --max "${{ inputs.max_items || '0' }}" \
+            --out out/new-leads.csv \
+            --out out/new-leads.jsonl \
+            --only-with-email
+
+      - name: Summary
+        if: always()
+        run: |
+          {
+            echo "### gitscout"
+            echo '```'
+            gitscout stats
+            echo '```'
+            echo "#### Recent runs"
+            echo '```'
+            gitscout runs --limit 5
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      # Saved under a run-specific key so each run leaves a restorable snapshot.
+      - name: Save state
+        if: always()
+        uses: actions/cache/save@v4
+        with:
+          path: state
+          key: gitscout-db-${{ github.run_id }}
+
+      - name: Upload leads
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: leads-${{ github.run_number }}
+          path: out/
+          if-no-files-found: warn
+          retention-days: 30
