@@ -388,3 +388,7 @@ Everything collected is public, but using it is still regulated.
 `gitscout run` and the REST path still work unchanged. New databases are migrated in
 place on first open (new columns and tables are added; nothing is dropped).
 `requires-python` moved to **3.11+** because target profiles use `tomllib`.
+
+## License
+
+[MIT](LICENSE) © 2026 Ayushkumarsinghyogesh
