@@ -1,10 +1,5 @@
 # gitscout
 
-> **Proprietary — not open source.** This source is published for evaluation and
-> reference only. You may read it and trial it unmodified for 30 days. Commercial use,
-> redistribution and derivative works require a written licence. See [LICENSE](LICENSE)
-> or open an issue to ask about commercial terms.
-
 Find the GitHub users who **fork, file issues, open pull requests, post in discussions
 or land commits** on repos you care about, then discover their **public emails**. Built
 on the official GitHub **GraphQL API**, designed to run on a **cron**.
@@ -77,7 +72,6 @@ gitscout scout --targets cloud-security --max 1000 -o out/leads.csv --only-with-
 | `gitscout runs [--json]` | audit log of every run, including scheduled ones |
 | `gitscout rate-limit` | REST quota and GraphQL points per token |
 | `gitscout suppress alice bob@x.com` | do-not-contact list, excluded from every export |
-| `gitscout apify REPO...` | third-party Apify fallback (costs money) |
 | `gitscout run REPO...` | the original REST pipeline, kept as a fallback |
 
 Global options: `--db path.db` (or `GITSCOUT_DB`), `-v` for debug logs.
@@ -189,24 +183,3 @@ Everything collected is public, but using it is still regulated.
   add anyone who opts out with `gitscout suppress`.
 * `--scan-websites` can surface addresses people did not intend to publish. It is
   opt-in for that reason.
-
-## Licence
-
-**gitscout is proprietary software. Copyright (c) 2026 Ayushkumarsinghyogesh. All
-rights reserved.** Publishing the source does not make it open source, and no
-open-source licence applies.
-
-| | |
-|---|---|
-| Read the source | ✅ allowed |
-| Clone and trial it unmodified, 30 days | ✅ allowed |
-| Production or commercial use | ❌ needs a written licence |
-| Copy, redistribute, sublicense or sell | ❌ not permitted |
-| Modify or build a derivative product | ❌ not permitted |
-| Include in a training corpus | ❌ not permitted |
-
-Full terms in [LICENSE](LICENSE). For a commercial licence, contact the copyright
-holder through the repository's GitHub profile.
-
-Dependencies (`httpx`, `typer`, `python-dotenv`) stay under their own permissive
-licences; nothing here restricts your rights in them.
