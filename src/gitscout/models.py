@@ -10,6 +10,15 @@ KINDS: tuple[str, ...] = ("stars", "forks", "issues")
 #: one, `contribs` is whoever actually landed commits on the default branch.
 ALL_KINDS: tuple[str, ...] = KINDS + ("prs", "discussions", "contribs")
 
+#: GitHub restricted the stargazers *list* to repo admins/collaborators on
+#: 2026-06-30 (the public star *count* still works). For any repo you do not
+#: administer the connection comes back empty, so `stars` is excluded from the
+#: default set -- asking for it just burns a query per repo per run. It stays in
+#: ALL_KINDS because it does work on repos you own.
+#: https://github.blog/changelog/2026-06-30-upcoming-access-restrictions-to-public-api-endpoints-and-ui-views/
+RESTRICTED_KINDS: frozenset[str] = frozenset({"stars"})
+DEFAULT_KINDS: tuple[str, ...] = tuple(k for k in ALL_KINDS if k not in RESTRICTED_KINDS)
+
 #: Which API backend to use for a run.
 BACKENDS: tuple[str, ...] = ("graphql", "rest", "apify")
 

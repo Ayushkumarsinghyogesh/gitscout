@@ -69,6 +69,7 @@ query Stars($owner: String!, $name: String!, $first: Int!, $after: String) {
     + """
   repository(owner: $owner, name: $name) {
     nameWithOwner
+    stargazerCount
     stargazers(first: $first, after: $after, orderBy: {field: STARRED_AT, direction: DESC}) {
       totalCount
       pageInfo { hasNextPage endCursor }
@@ -358,6 +359,32 @@ def commit_email_query(logins: Sequence[str]) -> tuple[str, dict[str, Any]]:
 #: Alias -> login mapping is positional, so callers can zip results back.
 def alias_for(index: int) -> str:
     return f"u{index}"
+
+
+def profiles_query(
+    logins: Sequence[str], include_email: bool = True
+) -> tuple[str, dict[str, Any]]:
+    """Fetch full profiles for a batch of logins, by alias.
+
+    Used by the events-based `stars` path: the events API hands back only a login, so
+    the profile has to be looked up. Batching keeps it at ~1 point per 25 people
+    instead of one REST call each.
+    """
+    if not logins:
+        raise ValueError("profiles_query needs at least one login")
+    decls = ", ".join(f"$l{i}: String!" for i in range(len(logins)))
+    aliases = "\n".join(
+        f"  u{i}: user(login: $l{i}) {{ ...UserFields }}" for i in range(len(logins))
+    )
+    query = (
+        f"query Profiles({decls}) {{\n"
+        + _RATE_LIMIT
+        + "\n"
+        + aliases
+        + "\n}\n"
+        + user_fields(include_email)
+    )
+    return query, {f"l{i}": login for i, login in enumerate(logins)}
 
 
 # ------------------------------------------------------------------- discovery

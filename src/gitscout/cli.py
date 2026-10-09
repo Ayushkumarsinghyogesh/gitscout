@@ -15,7 +15,7 @@ from .enrich_gql import GqlEnricher
 from .export import FORMATS, write_export
 from .github_client import GitHubClient, GitHubError
 from .graphql import GraphQLClient
-from .models import ALL_KINDS, KINDS
+from .models import ALL_KINDS, DEFAULT_KINDS, KINDS, RESTRICTED_KINDS
 from .pipeline import (
     ScoutResult,
     ingest_repos,
@@ -39,7 +39,18 @@ app = typer.Typer(
 )
 
 RepoArgs = Annotated[Optional[list[str]], typer.Argument(help="owner/name or GitHub URL")]
-KindsOpt = Annotated[str, typer.Option("--kinds", "-k", help=f"Comma list of: {', '.join(ALL_KINDS)}")]
+KindsOpt = Annotated[
+    Optional[str],
+    typer.Option(
+        "--kinds",
+        "-k",
+        help=(
+            f"Comma list of: {', '.join(ALL_KINDS)}. "
+            f"Default: {','.join(DEFAULT_KINDS)} "
+            f"({','.join(sorted(RESTRICTED_KINDS))} comes from the events API: recent only)"
+        ),
+    ),
+]
 MaxOpt = Annotated[int, typer.Option("--max", help="Soft cap per repo+kind per run (0 = unlimited)")]
 FreshOpt = Annotated[bool, typer.Option("--fresh", help="Ignore saved cursors and re-crawl")]
 DeepOpt = Annotated[bool, typer.Option("--deep", help="Run every email source, not just until first hit")]
@@ -54,11 +65,29 @@ def _settings(ctx: typer.Context) -> Settings:
     return ctx.obj
 
 
-def _kinds(value: str, allowed: Sequence[str] = ALL_KINDS) -> tuple[str, ...]:
+def _kinds(
+    value: str | None,
+    allowed: Sequence[str] = ALL_KINDS,
+    default: Sequence[str] = DEFAULT_KINDS,
+) -> tuple[str, ...]:
+    """Resolve -k. None means "the caller did not say", so use the default set."""
+    if value is None:
+        return tuple(k for k in default if k in allowed)
     try:
-        return parse_kinds(value, allowed)
+        selected = parse_kinds(value, allowed)
     except ValueError as exc:
         raise typer.BadParameter(str(exc)) from exc
+    restricted = [k for k in selected if k in RESTRICTED_KINDS]
+    if restricted:
+        typer.secho(
+            f"note: {', '.join(restricted)} is collected from the events API, because "
+            "GitHub restricted the stargazer list to repo admins on 2026-06-30. "
+            "That window holds only the last ~300 repo events, so you get recent stars, "
+            "not the full history -- run it on a schedule to keep up with new ones.",
+            fg=typer.colors.YELLOW,
+            err=True,
+        )
+    return selected
 
 
 def _progress(done: int, total: int) -> None:
@@ -147,7 +176,7 @@ def scout(
     ctx: typer.Context,
     repos: RepoArgs = None,
     targets: TargetsOpt = None,
-    kinds: KindsOpt = ",".join(ALL_KINDS),
+    kinds: KindsOpt = None,
     max_items: MaxOpt = 0,
     fresh: FreshOpt = False,
     incremental: Annotated[bool, typer.Option("--incremental", help="Only fetch what is new since the last run")] = False,
@@ -163,7 +192,7 @@ def scout(
     """GraphQL pipeline: ingest -> email discovery -> score -> export. The main command."""
     settings = _settings(ctx)
     _require_token(settings)
-    target_list = _run_sync_targets(repos or [], _kinds(kinds), targets)
+    target_list = _run_sync_targets(repos or [], _kinds(kinds), targets, kinds is not None)
     result = _run(
         run_scout(
             settings,
@@ -185,9 +214,11 @@ def scout(
     _report_scout(result)
 
 
-def _run_sync_targets(repos: list[str], kinds: tuple[str, ...], targets_file: str | None):
+def _run_sync_targets(
+    repos: list[str], kinds: tuple[str, ...], targets_file: str | None, kinds_given: bool = False
+):
     try:
-        return targets_for(repos, kinds, targets_file)
+        return targets_for(repos, kinds, targets_file, kinds_given=kinds_given)
     except (ValueError, FileNotFoundError) as exc:
         raise typer.BadParameter(str(exc)) from exc
 
@@ -197,7 +228,7 @@ def watch(
     ctx: typer.Context,
     repos: RepoArgs = None,
     targets: TargetsOpt = None,
-    kinds: KindsOpt = ",".join(ALL_KINDS),
+    kinds: KindsOpt = None,
     every: Annotated[str, typer.Option("--every", help="Interval: 30s, 15m, 6h, 1d")] = "6h",
     out: OutOpt = None,
     runs: Annotated[int, typer.Option("--runs", help="Stop after N runs (0 = forever)")] = 0,
@@ -212,7 +243,7 @@ def watch(
 
     settings = _settings(ctx)
     _require_token(settings)
-    target_list = _run_sync_targets(repos or [], _kinds(kinds), targets)
+    target_list = _run_sync_targets(repos or [], _kinds(kinds), targets, kinds is not None)
 
     async def go():
         stop = asyncio.Event()
@@ -336,7 +367,7 @@ def targets_list(ctx: typer.Context, name: TargetsOpt = None) -> None:
 def ingest(
     ctx: typer.Context,
     repos: Annotated[list[str], typer.Argument(help="owner/name or GitHub URL")],
-    kinds: KindsOpt = ",".join(ALL_KINDS),
+    kinds: KindsOpt = None,
     max_items: MaxOpt = 0,
     fresh: FreshOpt = False,
     api: Annotated[str, typer.Option("--api", help="graphql or rest")] = "graphql",
@@ -442,7 +473,7 @@ def enrich(
 def apify_cmd(
     ctx: typer.Context,
     repos: Annotated[list[str], typer.Argument(help="owner/name or GitHub URL")],
-    kinds: KindsOpt = "stars",
+    kinds: KindsOpt = None,
     out: OutOpt = None,
     only_with_email: OnlyEmailOpt = False,
 ) -> None:
@@ -511,7 +542,7 @@ def export(
 def run(
     ctx: typer.Context,
     repos: Annotated[list[str], typer.Argument(help="owner/name or GitHub URL")],
-    kinds: KindsOpt = ",".join(KINDS),
+    kinds: KindsOpt = None,
     max_items: MaxOpt = 0,
     fresh: FreshOpt = False,
     deep: DeepOpt = False,

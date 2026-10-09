@@ -218,7 +218,14 @@ class FakeGraphQL:
     def __init__(self) -> None:
         self.queue: dict[str, list[tuple[int, dict[str, Any]]]] = {}
         self.calls: list[tuple[str, dict[str, Any], dict[str, str]]] = []
+        self.rest: dict[str, Any] = {}
+        self.rest_calls: list[tuple[str, dict[str, str]]] = []
         self.headers = {"x-ratelimit-remaining": "4999", "x-ratelimit-reset": "9999999999"}
+
+    def add_rest(self, path: str, body: Any) -> "FakeGraphQL":
+        """Script a REST path (used by the events-based `stars` collector)."""
+        self.rest[path] = body
+        return self
 
     def add(self, op: str, data: dict[str, Any] | None = None, **kw: Any) -> "FakeGraphQL":
         """Queue one successful response for `op`."""
@@ -260,6 +267,12 @@ class FakeGraphQL:
         return [c[1] for c in self.calls if c[0] == op]
 
     def handler(self, request: httpx.Request) -> httpx.Response:
+        if request.method != "POST":
+            # Tests share one transport for both APIs; a REST GET (e.g. the events
+            # endpoint) gets an empty list unless `rest` is scripted for that path.
+            body = self.rest.get(request.url.path, [])
+            self.rest_calls.append((request.url.path, dict(request.url.params)))
+            return httpx.Response(200, json=body, headers=self.headers)
         payload = json.loads(request.content or b"{}")
         query = payload.get("query", "")
         name = op_name(query)
@@ -295,3 +308,8 @@ def repo_commit(
         "authoredDate": at,
         "author": {"name": name, "email": email, "user": user},
     }
+
+
+def watch_event(login: str, at: str = "2026-10-01T00:00:00Z") -> dict[str, Any]:
+    """A WatchEvent -- GitHub's name for 'someone starred this repo'."""
+    return {"type": "WatchEvent", "created_at": at, "actor": {"login": login}}

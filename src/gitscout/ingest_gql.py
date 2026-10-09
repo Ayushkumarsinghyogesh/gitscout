@@ -20,7 +20,7 @@ from typing import Any, Iterable, Mapping, Sequence
 from .emails import normalize_email, score
 from .graphql import GraphQLClient, MissingScopeError, Page
 from .ingest import parse_repo
-from .models import ALL_KINDS, EmailCandidate, Interaction, Profile
+from .models import ALL_KINDS, RESTRICTED_KINDS, EmailCandidate, Interaction, Profile
 from .queries import KIND_BODIES, kind_query
 from .storage import Store
 
@@ -67,15 +67,40 @@ class GqlIngestResult:
     complete: bool = False
     stopped_early: bool = False
     skipped: bool = False
+    restricted: bool = False
     total_count: int | None = None
 
     @property
     def status(self) -> str:
+        if self.restricted:
+            return "RESTRICTED by GitHub"
         if self.skipped:
             return "skipped (done)"
         if self.stopped_early:
             return "up to date"
         return "complete" if self.complete else "partial"
+
+
+#: Where each restricted kind publishes a public total, so an empty list can be told
+#: apart from a genuinely empty repo.
+_PUBLIC_COUNT_FIELD = {"stars": "stargazerCount"}
+
+
+def _public_count(kind: str, page: Page) -> int | None:
+    """The public total that sits beside a restricted list (e.g. `stargazerCount`)."""
+    field_name = _PUBLIC_COUNT_FIELD.get(kind)
+    if not field_name:
+        return None
+    value = page.parent.get(field_name)
+    return None if value is None else int(value)
+
+
+def _is_restricted(kind: str, page: Page) -> bool:
+    """Empty list while the public counter says there is data = access is restricted."""
+    if page.nodes or page.edges:
+        return False
+    public = _public_count(kind, page)
+    return bool(public and public > 0)
 
 
 def _user_type(node_type: str | None, login: str) -> str | None:
@@ -399,6 +424,20 @@ async def _crawl(
         if result.total_count is None:
             result.total_count = page.connection.get("totalCount")
 
+        if result.pages == 1 and kind in RESTRICTED_KINDS and _is_restricted(kind, page):
+            result.restricted = True
+            log.warning(
+                "%s: GitHub restricts this list to repo admins/collaborators since "
+                "2026-06-30, so it came back empty while the public count is %s. "
+                "Nothing to collect here. See "
+                "https://github.blog/changelog/2026-06-30-upcoming-access-restrictions-"
+                "to-public-api-endpoints-and-ui-views/",
+                key,
+                _public_count(kind, page),
+            )
+            await pages.aclose()
+            break
+
         items = extract(repo, page)
         if from_page_one and result.pages == 1 and items:
             # DESC order: the first page holds the newest interaction overall.
@@ -441,6 +480,12 @@ async def _crawl(
         if result.stopped_early:
             await pages.aclose()
             break
+
+    if result.restricted:
+        # Deliberately leave crawl_state untouched: marking it done would make a later
+        # run skip it even if the caller gains admin access to the repo.
+        store.clear_crawl_state(key)
+        return result
 
     if newest_seen:
         store.set_crawl_state(key, high_water=newest_seen, total_count=result.total_count)

@@ -589,3 +589,58 @@ def test_bot_commit_address_is_not_collected(gql, make_gql_client, store):
     res = _ingest(gql, make_gql_client, store, kind="contribs")
     assert res.emails_new == 1
     assert [r["login"] for r in store.export_rows()] == ["realdev"]
+
+
+# ---------------------------------- GitHub's stargazer-list restriction (2026-06-30)
+
+
+def _restricted_stars_body(public_count: int):
+    """What GitHub actually returns now: an empty list beside a non-zero public count."""
+    body = stars_body([], total=0)
+    body["repository"]["stargazerCount"] = public_count
+    return body
+
+
+def test_restricted_stargazer_list_is_reported_not_silently_completed(gql, make_gql_client, store):
+    """Seen live on 2026-10-08: every repo returned 0 stargazers but a real star count.
+
+    The old behaviour marked the crawl `done=1`, so it looked successful and would
+    never retry. That is the bug this guards.
+    """
+    gql.add("Stars", _restricted_stars_body(14985))
+
+    res = _ingest(gql, make_gql_client, store, kind="stars")
+
+    assert res.restricted is True
+    assert res.status == "RESTRICTED by GitHub"
+    assert (res.fetched, res.new) == (0, 0)
+    assert not res.complete
+    # crucially: nothing recorded as done, so it retries if access is ever granted
+    assert store.get_crawl_state("gql:o/r:stars") is None
+
+
+def test_a_genuinely_empty_repo_is_not_called_restricted(gql, make_gql_client, store):
+    """0 stars AND a 0 public count is just an unstarred repo, not a restriction."""
+    gql.add("Stars", _restricted_stars_body(0))
+    res = _ingest(gql, make_gql_client, store, kind="stars")
+    assert res.restricted is False
+    assert res.complete is True
+
+
+def test_stars_still_work_when_the_list_is_visible(gql, make_gql_client, store):
+    """On a repo you administer the list is returned, and nothing changes."""
+    body = stars_body([(gql_user("alice", email="a@acme.dev"), "2026-06-01T00:00:00Z")], total=1)
+    body["repository"]["stargazerCount"] = 1
+    gql.add("Stars", body)
+
+    res = _ingest(gql, make_gql_client, store, kind="stars")
+    assert res.restricted is False
+    assert (res.new, res.emails_new) == (1, 1)
+    assert store.get_crawl_state("gql:o/r:stars")["done"] is True
+
+
+def test_restriction_check_only_applies_to_restricted_kinds(gql, make_gql_client, store):
+    """An empty forks list is just an unforked repo; do not cry 'restricted'."""
+    gql.add("Forks", forks_body([]))
+    res = _ingest(gql, make_gql_client, store, kind="forks")
+    assert res.restricted is False and res.complete is True

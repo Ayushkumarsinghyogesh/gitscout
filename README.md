@@ -5,9 +5,21 @@
 > redistribution and derivative works require a written licence. See [LICENSE](LICENSE)
 > or open an issue to ask about commercial terms.
 
-Find the GitHub users who **star, fork, file issues, open pull requests, post in
-discussions or land commits** on repos you care about, then discover their **public
-emails**. Built on the official GitHub **GraphQL API**, designed to run on a **cron**.
+Find the GitHub users who **fork, file issues, open pull requests, post in discussions
+or land commits** on repos you care about, then discover their **public emails**. Built
+on the official GitHub **GraphQL API**, designed to run on a **cron**.
+
+> **On stargazers:** GitHub [restricted the stargazer list to repo admins and
+> collaborators on 2026-06-30](https://github.blog/changelog/2026-06-30-upcoming-access-restrictions-to-public-api-endpoints-and-ui-views/)
+> — REST `/stargazers` 404s and GraphQL `repository.stargazers` returns an empty
+> connection. The public star *count* still works.
+>
+> gitscout collects `stars` from the **events API** instead, where `WatchEvent` is still
+> published with the actor's login. That endpoint holds only the **last ~300 repo
+> events**, so you get *recent* stars, not the full history — on a busy repo that is
+> about a day and a half. Poll on a schedule and you capture every new star from now
+> on; the historical list is simply gone. `stars` is therefore not in the default signal
+> set — ask for it with `-k stars`.
 
 ```
 scout  =  ingest (interaction + profile in one query)
@@ -160,7 +172,7 @@ resumable and idempotent, so re-running the same command is always safe.
 ## Tests
 
 ```bash
-python -m pytest -q        # 329 tests, fully mocked: no network, no token needed
+python -m pytest -q        # 357 tests, fully mocked: no network, no token needed
 ```
 
 ---

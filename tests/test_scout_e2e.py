@@ -18,6 +18,7 @@ from gqlhelpers import (
     gql_user,
     op_name,
     stars_body,
+    watch_event,
 )
 from typer.testing import CliRunner
 
@@ -35,16 +36,23 @@ def run(coro):
 
 def test_full_graphql_pipeline(gql, tmp_path):
     """Stars + forks + issues + PRs -> profiles -> commit emails -> scored export."""
+    # `stars` comes from the events API now, plus a batched profile lookup
+    gql.add_rest(
+        "/repos/o/r/events",
+        [
+            watch_event("alice", "2024-06-01T00:00:00Z"),
+            watch_event("bob", "2024-05-01T00:00:00Z"),
+            watch_event("ci-bot", "2024-04-01T00:00:00Z"),
+            {"type": "PushEvent", "created_at": "2024-04-01T00:00:00Z", "actor": {"login": "noise"}},
+        ],
+    )
     gql.add(
-        "Stars",
-        stars_body(
-            [
-                (gql_user("alice", name="Alice", email="alice@acme.dev", company="Acme", followers=500), "2024-06-01T00:00:00Z"),
-                (gql_user("bob", name="Bob Brown"), "2024-05-01T00:00:00Z"),
-                (gql_bot("ci-bot"), "2024-04-01T00:00:00Z"),
-            ],
-            total=3,
-        ),
+        "Profiles",
+        {
+            "u0": gql_user("alice", name="Alice", email="alice@acme.dev", company="Acme", followers=500),
+            "u1": gql_user("bob", name="Bob Brown"),
+            "u2": gql_bot("ci-bot"),
+        },
     )
     gql.add("Forks", forks_body([(gql_user("carol"), "2024-03-01T00:00:00Z"), (gql_org("acme"), "2024-02-01T00:00:00Z")]))
     gql.add("Issues", authored_body("issues", [(gql_user("dave", bio="cloud security engineer"), "2024-07-01T00:00:00Z")]))
@@ -99,11 +107,10 @@ def test_full_graphql_pipeline(gql, tmp_path):
 
 
 def test_second_incremental_run_is_cheap_and_finds_nothing(gql, tmp_path):
-    page = stars_body([(gql_user("alice", email="a@acme.dev"), "2024-06-01T00:00:00Z")])
-    gql.add("Stars", page)
+    gql.add("Issues", authored_body("issues", [(gql_user("alice", email="a@acme.dev"), "2024-06-01T00:00:00Z")]))
     gql.add("CommitEmails", {})
     settings = Settings(tokens=("tok",), db_path=str(tmp_path / "t.db"))
-    targets = targets_from_repos(["o/r"], ("stars",))
+    targets = targets_from_repos(["o/r"], ("issues",))
 
     first = run(run_scout(settings, targets, transport=gql.transport))
     assert first.ingest.new == 1
@@ -115,14 +122,14 @@ def test_second_incremental_run_is_cheap_and_finds_nothing(gql, tmp_path):
 
 
 def test_new_only_export_contains_just_this_run(gql, tmp_path):
-    gql.add("Stars", stars_body([(gql_user("old", email="old@x.dev"), "2024-01-01T00:00:00Z")]))
+    gql.add("Issues", authored_body("issues", [(gql_user("old", email="old@x.dev"), "2024-01-01T00:00:00Z")]))
     gql.add("CommitEmails", {})
     settings = Settings(tokens=("tok",), db_path=str(tmp_path / "t.db"))
-    targets = targets_from_repos(["o/r"], ("stars",))
+    targets = targets_from_repos(["o/r"], ("issues",))
     run(run_scout(settings, targets, transport=gql.transport))
 
     gql.queue.clear()
-    gql.add("Stars", stars_body([(gql_user("fresh", email="fresh@x.dev"), "2024-09-01T00:00:00Z")]))
+    gql.add("Issues", authored_body("issues", [(gql_user("fresh", email="fresh@x.dev"), "2024-09-01T00:00:00Z")]))
     gql.add("CommitEmails", {})
     out = tmp_path / "new.csv"
     result = run(
@@ -136,7 +143,7 @@ def test_new_only_export_contains_just_this_run(gql, tmp_path):
 
 def test_a_failed_run_is_recorded_then_raised(gql, tmp_path):
     settings = Settings(tokens=("tok",), db_path=str(tmp_path / "t.db"))
-    targets = targets_from_repos(["o/r"], ("stars",))
+    targets = targets_from_repos(["o/r"], ("issues",))
     transport = httpx.MockTransport(lambda r: httpx.Response(400, json={"message": "bad"}))
 
     with pytest.raises(Exception):
@@ -150,12 +157,12 @@ def test_a_failed_run_is_recorded_then_raised(gql, tmp_path):
 
 
 def test_no_enrich_skips_the_commit_probe(gql, tmp_path):
-    gql.add("Stars", stars_body([(gql_user("a"), "2024-06-01T00:00:00Z")]))
+    gql.add("Issues", authored_body("issues", [(gql_user("a"), "2024-06-01T00:00:00Z")]))
     settings = Settings(tokens=("tok",), db_path=str(tmp_path / "t.db"))
     result = run(
         run_scout(
             settings,
-            targets_from_repos(["o/r"], ("stars",)),
+            targets_from_repos(["o/r"], ("issues",)),
             enrich=False,
             transport=gql.transport,
         )
@@ -335,3 +342,58 @@ def test_cli_db_exports_rows_to_a_file(tmp_path):
 def test_cli_db_empty_table_is_not_an_error(tmp_path):
     res = runner.invoke(app, ["--db", str(tmp_path / "t.db"), "db", "--table", "suppression"])
     assert res.exit_code == 0 and "no rows" in res.output
+
+
+def test_kinds_flag_narrows_a_target_profile(tmp_path):
+    """`-k X --targets P` used to ignore -k and crawl all of P's kinds."""
+    from gitscout.models import DEFAULT_KINDS
+
+    profile = tmp_path / "p.toml"
+    profile.write_text(
+        'name="p"\n'
+        '[[target]]\nrepo="o/a"\n'
+        '[[target]]\nrepo="o/b"\nkinds=["issues","prs"]\n',
+        encoding="utf-8",
+    )
+
+    # no -k: each target keeps its own kinds
+    wide = targets_for([], DEFAULT_KINDS, str(profile))
+    assert {t.repo: t.kinds for t in wide} == {
+        "o/a": DEFAULT_KINDS,  # no `kinds` in the entry -> the default set
+        "o/b": ("issues", "prs"),
+    }
+
+    # -k issues: both targets narrowed to issues only
+    narrow = targets_for([], ("issues",), str(profile), kinds_given=True)
+    assert {t.repo: t.kinds for t in narrow} == {"o/a": ("issues",), "o/b": ("issues",)}
+
+    # -k contribs: o/b does not collect contribs, so it drops out entirely
+    only_contribs = targets_for([], ("contribs",), str(profile), kinds_given=True)
+    assert {t.repo: t.kinds for t in only_contribs} == {"o/a": ("contribs",)}
+
+    # asking for a kind no target collects is an error, not a silent empty run
+    issues_only = tmp_path / "issues_only.toml"
+    issues_only.write_text(
+        'name="p"\n[[target]]\nrepo="o/b"\nkinds=["issues"]\n', encoding="utf-8"
+    )
+    with pytest.raises(ValueError, match="no target in"):
+        targets_for([], ("stars",), str(issues_only), kinds_given=True)
+
+
+def test_default_kinds_excludes_the_restricted_stars_list():
+    from gitscout.models import ALL_KINDS, DEFAULT_KINDS, RESTRICTED_KINDS
+
+    assert "stars" in ALL_KINDS  # still available for repos you administer
+    assert "stars" not in DEFAULT_KINDS  # but not crawled by default
+    assert RESTRICTED_KINDS == {"stars"}
+    assert set(DEFAULT_KINDS) == set(ALL_KINDS) - RESTRICTED_KINDS
+
+
+def test_cli_explains_how_stars_is_collected(tmp_path, monkeypatch):
+    """stars comes from the events API now, and the note must say so plus its limit."""
+    monkeypatch.setenv("GITHUB_TOKENS", "tok")
+    res = runner.invoke(
+        app, ["--db", str(tmp_path / "t.db"), "scout", "o/r", "-k", "stars", "--no-enrich"]
+    )
+    assert "events API" in res.output
+    assert "300 repo events" in res.output  # the limitation is stated, not hidden

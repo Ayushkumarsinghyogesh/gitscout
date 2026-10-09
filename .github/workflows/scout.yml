@@ -49,9 +49,9 @@ jobs:
       HUNTER_API_KEY: ${{ secrets.HUNTER_API_KEY }}
 
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
 
-      - uses: actions/setup-python@v5
+      - uses: actions/setup-python@v7
         with:
           python-version: "3.12"
 
@@ -63,17 +63,33 @@ jobs:
       # the restore-keys prefix picks up the most recent cache available.
       - name: Restore state
         id: restore
-        uses: actions/cache/restore@v4
+        uses: actions/cache/restore@v6
         with:
           path: state
           key: gitscout-db-${{ github.run_id }}
           restore-keys: |
             gitscout-db-
 
-      - name: Preflight
+      # Without this secret nothing can possibly work, so say exactly that rather than
+      # letting it surface as a generic non-zero exit from `doctor`.
+      - name: Check the token secret is set
         run: |
           mkdir -p state out
-          gitscout doctor --targets "${{ inputs.targets || 'cloud-security' }}"
+          if [ -z "$GITHUB_TOKENS" ]; then
+            echo "::error title=Missing secret::GITSCOUT_GITHUB_TOKENS is not set. Add it under Settings > Secrets and variables > Actions."
+            echo "Use a personal access token with the read:user scope."
+            echo "Do NOT use the built-in GITHUB_TOKEN: in Actions it is capped at"
+            echo "1,000 GraphQL points per repo and cannot read profile emails."
+            exit 1
+          fi
+          echo "Token secret is present."
+
+      # Diagnostics only. A transient GitHub hiccup must not skip the whole scheduled
+      # run, so this reports and moves on; `Scout` below fails loudly if anything is
+      # actually broken.
+      - name: Preflight (diagnostics)
+        continue-on-error: true
+        run: gitscout doctor --targets "${{ inputs.targets || 'cloud-security' }}"
 
       - name: Scout
         run: |
@@ -102,14 +118,14 @@ jobs:
       # Saved under a run-specific key so each run leaves a restorable snapshot.
       - name: Save state
         if: always()
-        uses: actions/cache/save@v4
+        uses: actions/cache/save@v6
         with:
           path: state
           key: gitscout-db-${{ github.run_id }}
 
       - name: Upload leads
         if: always()
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: leads-${{ github.run_number }}
           path: out/

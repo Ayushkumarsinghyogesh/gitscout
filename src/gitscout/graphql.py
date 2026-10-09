@@ -97,12 +97,18 @@ class QueryResult:
 
 @dataclass
 class Page:
-    """One page of a GraphQL connection."""
+    """One page of a GraphQL connection.
+
+    ``parent`` is the object the connection hangs off (e.g. ``repository``), so callers
+    can read sibling scalars selected alongside it -- ``stargazerCount`` next to
+    ``stargazers``, for instance.
+    """
 
     connection: dict[str, Any]
     cost: int
     cursor: str | None
     has_next: bool
+    parent: dict[str, Any] = field(default_factory=dict)
 
     @property
     def nodes(self) -> list[dict[str, Any]]:
@@ -319,11 +325,13 @@ class GraphQLClient:
                 return  # repo missing / blocked: nothing to walk
 
             info = connection.get("pageInfo") or {}
+            parent = result.pluck(*path[:-1]) if len(path) > 1 else result.data
             page = Page(
                 connection=dict(connection),
                 cost=result.cost,
                 cursor=info.get("endCursor"),
                 has_next=bool(info.get("hasNextPage")),
+                parent=dict(parent) if isinstance(parent, Mapping) else {},
             )
             yield page
 

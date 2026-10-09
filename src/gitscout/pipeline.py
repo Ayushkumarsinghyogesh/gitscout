@@ -3,7 +3,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Callable, Sequence
@@ -17,6 +17,7 @@ from .export import write_export
 from .github_client import GitHubClient
 from .graphql import GraphQLClient
 from .ingest import IngestResult, ingest_kind, parse_repo
+from .ingest_events import ingest_stars_via_events
 from .ingest_gql import EmailScope, GqlIngestResult, IngestTotals, ingest_repos_gql
 from .models import ALL_KINDS, KINDS, Target
 from .providers import load_providers, run_providers
@@ -232,20 +233,49 @@ async def run_scout(
             async with GraphQLClient(
                 settings.tokens, user_agent=settings.user_agent, transport=transport
             ) as client:
-                # Grouped by kind-set so a target can opt out of noisy signals.
-                for target in targets:
-                    totals = await ingest_repos_gql(
-                        client,
-                        store,
-                        [target.repo],
-                        target.kinds,
-                        max_items=max_items,
-                        fresh=fresh,
-                        incremental=incremental,
-                        page_size=settings.page_size,
-                        scope=scope,
-                    )
-                    result.ingest.results.extend(totals.results)
+                # `stars` has no working GraphQL connection any more, so it goes
+                # through the events API instead; see [ingest_events.py].
+                needs_rest = any("stars" in t.kinds for t in targets)
+                rest: GitHubClient | None = None
+                try:
+                    if needs_rest:
+                        rest = GitHubClient(
+                            settings.tokens,
+                            user_agent=settings.user_agent,
+                            transport=transport,
+                        )
+
+                    for target in targets:
+                        gql_kinds = tuple(k for k in target.kinds if k != "stars")
+                        if gql_kinds:
+                            totals = await ingest_repos_gql(
+                                client,
+                                store,
+                                [target.repo],
+                                gql_kinds,
+                                max_items=max_items,
+                                fresh=fresh,
+                                incremental=incremental,
+                                page_size=settings.page_size,
+                                scope=scope,
+                            )
+                            result.ingest.results.extend(totals.results)
+                        if "stars" in target.kinds and rest is not None:
+                            result.ingest.results.append(
+                                await ingest_stars_via_events(
+                                    rest,
+                                    client,
+                                    store,
+                                    target.repo,
+                                    incremental=incremental,
+                                    fresh=fresh,
+                                    max_items=max_items,
+                                    scope=scope,
+                                )
+                            )
+                finally:
+                    if rest is not None:
+                        await rest.aclose()
 
                 if enrich:
                     scanner = (
@@ -379,13 +409,33 @@ def targets_for(
     repos: Sequence[str],
     kinds: Sequence[str],
     targets_file: str | None = None,
+    *,
+    kinds_given: bool = False,
 ) -> list[Target]:
-    """Build the target list from a profile file, explicit repos, or both."""
+    """Build the target list from a profile file, explicit repos, or both.
+
+    ``kinds_given`` means the caller passed ``-k`` explicitly. In that case it narrows
+    what a profile asks for, instead of being silently ignored -- `-k stars --targets X`
+    used to quietly crawl all of X's kinds, which is the opposite of what was asked.
+    """
     from .targets import load_targets
 
     out: list[Target] = []
     if targets_file:
-        out.extend(load_targets(targets_file))
+        profile = load_targets(targets_file)
+        if kinds_given:
+            wanted = tuple(kinds)
+            narrowed = []
+            for target in profile:
+                keep = tuple(k for k in target.kinds if k in wanted)
+                if keep:
+                    narrowed.append(replace(target, kinds=keep))
+            if not narrowed:
+                raise ValueError(
+                    f"no target in {targets_file!r} collects any of {', '.join(wanted)}"
+                )
+            profile = narrowed
+        out.extend(profile)
     if repos:
         out.extend(targets_from_repos(repos, kinds))
     if not out:

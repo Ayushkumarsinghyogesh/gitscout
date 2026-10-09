@@ -6,7 +6,7 @@ import asyncio
 import pytest
 from gqlhelpers import connection
 
-from gitscout.models import ALL_KINDS
+from gitscout.models import ALL_KINDS, DEFAULT_KINDS
 from gitscout.targets import (
     available_profiles,
     build_search_query,
@@ -57,7 +57,9 @@ def test_per_target_kinds_override_the_default(tmp_path):
         """,
     )
     a, b = load_targets(path)
-    assert a.kinds == ALL_KINDS
+    # omitting `kinds` means DEFAULT_KINDS -- notably without the restricted `stars`
+    assert a.kinds == DEFAULT_KINDS
+    assert "stars" not in a.kinds and "stars" in ALL_KINDS
     assert b.kinds == ("issues", "prs")
     assert (b.weight, b.note) == (0.5, "high intent only")
 

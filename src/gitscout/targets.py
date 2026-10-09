@@ -15,7 +15,7 @@ from typing import Any, Iterable, Sequence
 
 from .graphql import GraphQLClient
 from .ingest import parse_repo
-from .models import ALL_KINDS, Target
+from .models import ALL_KINDS, DEFAULT_KINDS, Target
 from .queries import DISCOVER, DISCOVER_PATH
 
 log = logging.getLogger(__name__)
@@ -29,14 +29,20 @@ _SEARCH_DIRS = (
 
 
 def _coerce_kinds(raw: Any) -> tuple[str, ...]:
+    """Kinds for one target entry. Omitting `kinds` means DEFAULT_KINDS, not ALL_KINDS.
+
+    The difference matters: ALL_KINDS still contains `stars`, which GitHub restricts to
+    repo admins, so defaulting to it would spend a wasted query per repo per run. A
+    profile can still ask for `stars` explicitly, for repos you administer.
+    """
     if raw is None:
-        return ALL_KINDS
+        return DEFAULT_KINDS
     items = raw.split(",") if isinstance(raw, str) else list(raw)
     kinds = tuple(dict.fromkeys(str(k).strip().lower() for k in items if str(k).strip()))
     bad = [k for k in kinds if k not in ALL_KINDS]
     if bad:
         raise ValueError(f"unknown kinds {bad} (expected any of {', '.join(ALL_KINDS)})")
-    return kinds or ALL_KINDS
+    return kinds or DEFAULT_KINDS
 
 
 def load_targets(path: str | Path) -> list[Target]:

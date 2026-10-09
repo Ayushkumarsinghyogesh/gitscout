@@ -4,7 +4,12 @@
 # product: people who star Prowler or file an issue on Checkov have already told you
 # what problem they are working on.
 #
-# `kinds` defaults to all six signals: stars, forks, issues, prs, discussions, contribs.
+# `kinds` defaults to forks, issues, prs, discussions, contribs.
+#
+# `stars` is NOT collected by default. GitHub restricted the stargazer *list* to repo
+# admins on 2026-06-30, so gitscout reads it from the events API instead -- which only
+# holds the last ~300 repo events. Add `kinds = [..., "stars"]` and run on a schedule if
+# you want to track new stars; the historical list is not retrievable.
 # Narrow it per repo when a repo is so large that stars are mostly noise -- see the note
 # on kubernetes-sigs/kubespray below. `contribs` reads the default-branch commit history,
 # which is the most expensive signal to backfill on a very active repo; bound the first

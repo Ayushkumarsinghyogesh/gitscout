@@ -4,7 +4,7 @@ from __future__ import annotations
 import asyncio
 
 import pytest
-from gqlhelpers import gql_user, stars_body
+from gqlhelpers import authored_body, gql_user
 
 from gitscout.config import Settings
 from gitscout.scheduler import (
@@ -21,7 +21,7 @@ def run(coro):
     return asyncio.run(coro)
 
 
-TARGETS = targets_from_repos(["o/r"], ("stars",))
+TARGETS = targets_from_repos(["o/r"], ("issues",))
 
 
 def test_parse_interval_units():
@@ -59,7 +59,7 @@ def _settings(tmp_path):
 
 
 def test_watch_runs_the_requested_number_of_times(gql, tmp_path, monkeypatch):
-    gql.add("Stars", stars_body([(gql_user("alice", email="a@acme.dev"), "2024-06-01T00:00:00Z")]))
+    gql.add("Issues", authored_body("issues", [(gql_user("alice", email="a@acme.dev"), "2024-06-01T00:00:00Z")]))
     gql.add("CommitEmails", {})
     slept = []
 
@@ -124,7 +124,7 @@ def _always_fatal():
 
 
 def test_watch_stops_when_the_stop_event_is_set(gql, tmp_path):
-    gql.add("Stars", stars_body([(gql_user("a"), "2024-06-01T00:00:00Z")]))
+    gql.add("Issues", authored_body("issues", [(gql_user("a"), "2024-06-01T00:00:00Z")]))
     gql.add("CommitEmails", {})
 
     async def go():
@@ -148,7 +148,7 @@ def test_watch_stops_when_the_stop_event_is_set(gql, tmp_path):
 
 
 def test_watch_records_every_run_in_the_audit_log(gql, tmp_path):
-    gql.add("Stars", stars_body([(gql_user("a"), "2024-06-01T00:00:00Z")]))
+    gql.add("Issues", authored_body("issues", [(gql_user("a"), "2024-06-01T00:00:00Z")]))
     gql.add("CommitEmails", {})
     settings = _settings(tmp_path)
 
@@ -166,7 +166,7 @@ def test_watch_records_every_run_in_the_audit_log(gql, tmp_path):
 def test_watch_exports_only_this_run_s_finds(gql, tmp_path):
     import csv
 
-    gql.add("Stars", stars_body([(gql_user("alice", email="a@acme.dev"), "2024-06-01T00:00:00Z")]))
+    gql.add("Issues", authored_body("issues", [(gql_user("alice", email="a@acme.dev"), "2024-06-01T00:00:00Z")]))
     gql.add("CommitEmails", {})
     out = tmp_path / "new.csv"
 
@@ -190,7 +190,7 @@ def test_watch_exports_only_this_run_s_finds(gql, tmp_path):
 def test_watch_can_export_everything_instead(gql, tmp_path):
     import csv
 
-    gql.add("Stars", stars_body([(gql_user("alice", email="a@acme.dev"), "2024-06-01T00:00:00Z")]))
+    gql.add("Issues", authored_body("issues", [(gql_user("alice", email="a@acme.dev"), "2024-06-01T00:00:00Z")]))
     gql.add("CommitEmails", {})
     out = tmp_path / "all.csv"
 
