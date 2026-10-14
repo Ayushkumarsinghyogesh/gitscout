@@ -16,6 +16,8 @@ from __future__ import annotations
 
 from typing import Any, Sequence
 
+from .models import THREAD_KINDS
+
 #: Fields pulled for every discovered account, except the email.
 _USER_FIELD_NAMES = (
     "__typename",
@@ -55,9 +57,9 @@ def user_fields(include_email: bool = True) -> str:
     return "\nfragment UserFields on User {\n" + body + "\n}\n"
 
 
-#: The default (with email), kept as a module constant for the common case.
+#: The default (with email), kept as a module constant for the common case. The
+#: no-email variant is built on demand by `user_fields(False)`.
 USER_FIELDS = user_fields(True)
-USER_FIELDS_NO_EMAIL = user_fields(False)
 
 _RATE_LIMIT = "  rateLimit { cost remaining resetAt limit nodeCount }"
 
@@ -282,6 +284,356 @@ STARS, FORKS, ISSUES, PRS, DISCUSSIONS, CONTRIBUTORS = (
 #: Kinds whose connection is newest-first without an explicit `orderBy`.
 NATURALLY_NEWEST_FIRST = frozenset({"contribs"})
 
+# ------------------------------------------------------------- thread details
+
+#: Full records for the three *discussion-shaped* sections of a repo -- issues, pull
+#: requests and discussions -- with their comment threads.
+#:
+#: Deliberately separate documents from the interaction crawl in `KIND_BODIES`. That
+#: crawl has to stay at ~1 point per 100 items or the cron path stops being
+#: affordable; these ask for the body, labels, participants and a slice of the thread
+#: as well. `gitscout doctor` reports what a page of each really costs.
+#:
+#: Comment authors arrive as login + __typename only. The UserFields fragment is
+#: deliberately not used here: it would multiply every profile field by the thread
+#: length, and anyone worth contacting is already profiled by the interaction crawl.
+#:
+#: Every connection carries an explicit `first`, including `reactions`: GitHub rejects
+#: a connection without one, so `reactions(first: 1) { totalCount }` is the cheapest
+#: legal way to read a count.
+
+#: Shared by issues and pull requests -- both are `IssueComment` connections.
+_ISSUE_COMMENT_FIELDS = """
+          nodes {
+            id
+            createdAt
+            updatedAt
+            authorAssociation
+            body
+            author { __typename login }
+          }
+"""
+
+#: `labels`, `assignees`, `participants` and `reactions` are identical on issues and
+#: pull requests, so the selection is shared rather than copied.
+_SHARED_THREAD_FIELDS = """
+        reactions(first: 1) { totalCount }
+        labels(first: 10) { totalCount nodes { name } }
+        assignees(first: 5) { nodes { login } }
+        milestone { title }
+        participants(first: 20) { totalCount nodes { login } }
+"""
+
+_ISSUE_DETAILS_BODY = (
+    """
+query IssueDetails(
+  $owner: String!
+  $name: String!
+  $first: Int!
+  $after: String
+  $comments: Int!
+  $order: IssueOrder!
+) {
+"""
+    + _RATE_LIMIT
+    + """
+  repository(owner: $owner, name: $name) {
+    nameWithOwner
+    issues(first: $first, after: $after, states: [OPEN, CLOSED], orderBy: $order) {
+      totalCount
+      pageInfo { hasNextPage endCursor }
+      nodes {
+        id
+        number
+        url
+        title
+        body
+        state
+        stateReason
+        createdAt
+        updatedAt
+        closedAt
+        locked
+        authorAssociation
+        author { __typename login }
+"""
+    + _SHARED_THREAD_FIELDS
+    + """
+        thread: comments(first: $comments) {
+          totalCount
+          pageInfo { hasNextPage endCursor }
+"""
+    + _ISSUE_COMMENT_FIELDS
+    + """
+        }
+      }
+    }
+  }
+}
+"""
+)
+
+#: Pull requests add the review verdict and the size of the change -- both strong
+#: signals about how involved someone actually is. Reviews are stored as thread
+#: comments with ``comment_type = 'review'``, so a reviewer counts as involved even
+#: when they never left an ordinary comment.
+_PR_DETAILS_BODY = (
+    """
+query PullRequestDetails(
+  $owner: String!
+  $name: String!
+  $first: Int!
+  $after: String
+  $comments: Int!
+  $order: IssueOrder!
+) {
+"""
+    + _RATE_LIMIT
+    + """
+  repository(owner: $owner, name: $name) {
+    nameWithOwner
+    pullRequests(
+      first: $first
+      after: $after
+      states: [OPEN, CLOSED, MERGED]
+      orderBy: $order
+    ) {
+      totalCount
+      pageInfo { hasNextPage endCursor }
+      nodes {
+        id
+        number
+        url
+        title
+        body
+        state
+        createdAt
+        updatedAt
+        closedAt
+        mergedAt
+        merged
+        mergedBy { login }
+        isDraft
+        locked
+        authorAssociation
+        author { __typename login }
+        additions
+        deletions
+        changedFiles
+        baseRefName
+        headRefName
+        reviewDecision
+        commits(first: 1) { totalCount }
+"""
+    + _SHARED_THREAD_FIELDS
+    + """
+        reviews(first: $comments) {
+          totalCount
+          nodes {
+            id
+            state
+            body
+            submittedAt
+            updatedAt
+            authorAssociation
+            author { __typename login }
+          }
+        }
+        thread: comments(first: $comments) {
+          totalCount
+          pageInfo { hasNextPage endCursor }
+"""
+    + _ISSUE_COMMENT_FIELDS
+    + """
+        }
+      }
+    }
+  }
+}
+"""
+)
+
+#: Discussions are a different type: no assignees or milestone, but a category, an
+#: upvote count and an accepted answer. ``isAnswer`` on a comment is the most useful
+#: field in the section -- it marks the person who solved someone else's problem.
+_DISCUSSION_DETAILS_BODY = (
+    """
+query DiscussionDetails(
+  $owner: String!
+  $name: String!
+  $first: Int!
+  $after: String
+  $comments: Int!
+  $order: DiscussionOrder!
+) {
+"""
+    + _RATE_LIMIT
+    + """
+  repository(owner: $owner, name: $name) {
+    nameWithOwner
+    discussions(first: $first, after: $after, orderBy: $order) {
+      totalCount
+      pageInfo { hasNextPage endCursor }
+      nodes {
+        id
+        number
+        url
+        title
+        body
+        createdAt
+        updatedAt
+        lastEditedAt
+        closed
+        closedAt
+        locked
+        authorAssociation
+        upvoteCount
+        isAnswered
+        author { __typename login }
+        category { name emoji isAnswerable }
+        answer { createdAt author { __typename login } }
+        reactions(first: 1) { totalCount }
+        labels(first: 10) { totalCount nodes { name } }
+        thread: comments(first: $comments) {
+          totalCount
+          pageInfo { hasNextPage endCursor }
+          nodes {
+            id
+            createdAt
+            updatedAt
+            body
+            isAnswer
+            upvoteCount
+            author { __typename login }
+            replies(first: 5) {
+              totalCount
+              nodes {
+                id
+                createdAt
+                updatedAt
+                body
+                author { __typename login }
+              }
+            }
+          }
+        }
+      }
+    }
+  }
+}
+"""
+)
+
+#: kind -> (document, connection path, the `orderBy` input the connection accepts).
+#: The kind names match the interaction kinds, so `-k issues,prs` means the same
+#: thing in both stages.
+THREAD_BODIES: dict[str, tuple[str, tuple[str, ...], str]] = {
+    "issues": (_ISSUE_DETAILS_BODY, ("repository", "issues"), "IssueOrder"),
+    "prs": (_PR_DETAILS_BODY, ("repository", "pullRequests"), "IssueOrder"),
+    "discussions": (
+        _DISCUSSION_DETAILS_BODY,
+        ("repository", "discussions"),
+        "DiscussionOrder",
+    ),
+}
+
+#: Backfill walks CREATED_AT: it never reorders under a cursor, so a resumed crawl
+#: cannot skip or repeat pages. The incremental pass walks UPDATED_AT instead, which
+#: is the only ordering that surfaces a two-year-old thread someone replied to today.
+THREAD_ORDER_CREATED = {"field": "CREATED_AT", "direction": "DESC"}
+THREAD_ORDER_UPDATED = {"field": "UPDATED_AT", "direction": "DESC"}
+
+
+def thread_query(kind: str) -> tuple[str, tuple[str, ...]]:
+    """The document and connection path for one thread kind."""
+    if kind not in THREAD_BODIES:
+        raise KeyError(kind)
+    body, path, _order = THREAD_BODIES[kind]
+    return body, path
+
+
+#: The newest comments of a thread longer than the per-thread cap. Paging a
+#: 400-comment thread forward would cost 20 queries for context nobody reads; the
+#: tail is where the current state of the conversation lives, so we take `last` and
+#: record that the middle is missing (`threads.comments_truncated`).
+_TAIL_BODIES = {
+    "issues": """
+query IssueCommentsTail($owner: String!, $name: String!, $number: Int!, $last: Int!) {
+"""
+    + _RATE_LIMIT
+    + """
+  repository(owner: $owner, name: $name) {
+    issue(number: $number) {
+      number
+      comments(last: $last) {
+        totalCount
+"""
+    + _ISSUE_COMMENT_FIELDS
+    + """
+      }
+    }
+  }
+}
+""",
+    "prs": """
+query PullRequestCommentsTail($owner: String!, $name: String!, $number: Int!, $last: Int!) {
+"""
+    + _RATE_LIMIT
+    + """
+  repository(owner: $owner, name: $name) {
+    pullRequest(number: $number) {
+      number
+      comments(last: $last) {
+        totalCount
+"""
+    + _ISSUE_COMMENT_FIELDS
+    + """
+      }
+    }
+  }
+}
+""",
+    "discussions": """
+query DiscussionCommentsTail($owner: String!, $name: String!, $number: Int!, $last: Int!) {
+"""
+    + _RATE_LIMIT
+    + """
+  repository(owner: $owner, name: $name) {
+    discussion(number: $number) {
+      number
+      comments(last: $last) {
+        totalCount
+        nodes {
+          id
+          createdAt
+          updatedAt
+          body
+          isAnswer
+          upvoteCount
+          author { __typename login }
+        }
+      }
+    }
+  }
+}
+""",
+}
+
+#: kind -> the path to the single thread a tail query returns.
+TAIL_PATHS: dict[str, tuple[str, ...]] = {
+    "issues": ("repository", "issue"),
+    "prs": ("repository", "pullRequest"),
+    "discussions": ("repository", "discussion"),
+}
+
+
+def tail_query(kind: str) -> tuple[str, tuple[str, ...]]:
+    """The tail document and the path to the thread it returns."""
+    if kind not in _TAIL_BODIES:
+        raise KeyError(kind)
+    return _TAIL_BODIES[kind], TAIL_PATHS[kind]
+
+
 # --------------------------------------------------------------- commit emails
 
 #: Probe a user's own (non-fork) repos for commit author emails.
@@ -433,3 +785,59 @@ query Viewer {
 
 #: Cheapest possible shape-check per kind, used by `gitscout doctor`.
 PROBE_REPO = ("octocat", "Hello-World")
+
+
+# ------------------------------------------------------- profile extras
+
+#: Links a person has chosen to publish on their own GitHub profile, plus how many
+#: public repositories they own. `socialAccounts` is where GitHub keeps the LinkedIn
+#: link people add themselves, which makes it the one legitimate GitHub-side bridge
+#: to a LinkedIn-keyed CRM. Both connections need an explicit `first`.
+_SOCIAL_FIELDS = """
+fragment SocialFields on User {
+  login
+  repositories(first: 1, privacy: PUBLIC, ownerAffiliations: [OWNER]) { totalCount }
+  socialAccounts(first: 10) { nodes { provider url } }
+}
+"""
+
+
+def social_query(logins: Sequence[str]) -> tuple[str, dict[str, Any]]:
+    """Batch-fetch social links and public repo counts, by alias."""
+    if not logins:
+        raise ValueError("social_query needs at least one login")
+    decls = ", ".join(f"$l{i}: String!" for i in range(len(logins)))
+    aliases = "\n".join(
+        f"  u{i}: user(login: $l{i}) {{ ...SocialFields }}" for i in range(len(logins))
+    )
+    query = f"query Social({decls}) {{\n" + _RATE_LIMIT + "\n" + aliases + "\n}\n" + _SOCIAL_FIELDS
+    return query, {f"l{i}": login for i, login in enumerate(logins)}
+
+
+#: One repository's identity and headline numbers, for the repository registry.
+#: `databaseId` is the stable identifier: it survives a rename or a transfer, where
+#: `nameWithOwner` does not.
+REPO_INFO = (
+    """
+query RepoInfo($owner: String!, $name: String!) {
+"""
+    + _RATE_LIMIT
+    + """
+  repository(owner: $owner, name: $name) {
+    id
+    databaseId
+    nameWithOwner
+    name
+    owner { login }
+    url
+    description
+    homepageUrl
+    stargazerCount
+    forkCount
+    isArchived
+    primaryLanguage { name }
+    repositoryTopics(first: 10) { nodes { topic { name } } }
+  }
+}
+"""
+)

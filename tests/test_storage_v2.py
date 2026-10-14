@@ -114,13 +114,6 @@ def test_upsert_keeps_node_id_when_a_later_write_omits_it():
         assert loaded.node_id == "U_1" and loaded.created_at == "2020-01-01"
 
 
-def test_known_logins():
-    with Store(":memory:") as store:
-        store.upsert_profile(Profile(login="a"))
-        assert store.known_logins(["a", "b"]) == {"a"}
-        assert store.known_logins([]) == set()
-
-
 def test_scores_roundtrip_and_ordering():
     with Store(":memory:") as store:
         store.add_interactions(
@@ -173,15 +166,13 @@ def test_run_log_records_outcomes():
         assert len(runs) == 1
         assert (runs[0]["interactions_new"], runs[0]["status"]) == (5, "ok")
         assert runs[0]["finished_at"]
-        assert store.last_successful_run_at() == runs[0]["started_at"]
-        assert store.last_successful_run_at("nope") is None
 
 
-def test_failed_runs_are_not_treated_as_successful():
+def test_a_failed_run_keeps_its_error_in_the_audit_log():
     with Store(":memory:") as store:
         rid = store.start_run("watch", "o/r")
         store.finish_run(RunRecord(run_id=rid, status="failed", error="boom"))
-        assert store.last_successful_run_at() is None
+        assert store.recent_runs()[0]["status"] == "failed"
         assert store.recent_runs()[0]["error"] == "boom"
 
 

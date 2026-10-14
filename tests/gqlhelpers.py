@@ -313,3 +313,246 @@ def repo_commit(
 def watch_event(login: str, at: str = "2026-10-01T00:00:00Z") -> dict[str, Any]:
     """A WatchEvent -- GitHub's name for 'someone starred this repo'."""
     return {"type": "WatchEvent", "created_at": at, "actor": {"login": login}}
+
+
+
+def comment(
+    comment_id: str,
+    author: dict[str, Any] | None,
+    *,
+    body: str = "a comment",
+    at: str = "2026-01-02T00:00:00Z",
+    association: str = "NONE",
+    is_answer: bool | None = None,
+    upvotes: int | None = None,
+    replies: Sequence[dict[str, Any]] = (),
+) -> dict[str, Any]:
+    """An IssueComment or DiscussionComment node."""
+    node: dict[str, Any] = {
+        "id": comment_id,
+        "createdAt": at,
+        "updatedAt": at,
+        "authorAssociation": association,
+        "body": body,
+        "author": author,
+    }
+    if is_answer is not None:
+        node["isAnswer"] = is_answer
+    if upvotes is not None:
+        node["upvoteCount"] = upvotes
+    if replies:
+        node["replies"] = connection(nodes=list(replies))
+    return node
+
+
+def review(
+    review_id: str,
+    author: dict[str, Any] | None,
+    *,
+    state: str = "APPROVED",
+    body: str = "",
+    at: str = "2026-01-04T00:00:00Z",
+    association: str = "MEMBER",
+) -> dict[str, Any]:
+    """A PullRequestReview node -- a verdict, with or without a body."""
+    return {
+        "id": review_id,
+        "state": state,
+        "body": body,
+        "submittedAt": at,
+        "updatedAt": at,
+        "authorAssociation": association,
+        "author": author,
+    }
+
+
+def _thread_common(
+    number: int,
+    author: dict[str, Any] | None,
+    *,
+    title: str | None,
+    body: str,
+    created: str,
+    updated: str | None,
+    association: str,
+    labels: Sequence[str],
+    reactions: int,
+    comments: Sequence[dict[str, Any]],
+    comments_total: int | None,
+) -> dict[str, Any]:
+    return {
+        "id": f"T_{number}",
+        "number": number,
+        "url": f"https://github.com/o/r/issues/{number}",
+        "title": title if title is not None else f"Thread {number}",
+        "body": body,
+        "createdAt": created,
+        "updatedAt": updated or created,
+        "locked": False,
+        "authorAssociation": association,
+        "author": author,
+        "reactions": {"totalCount": reactions},
+        "labels": {"totalCount": len(labels), "nodes": [{"name": n} for n in labels]},
+        "thread": connection(
+            nodes=list(comments),
+            total=comments_total if comments_total is not None else len(comments),
+        ),
+    }
+
+
+def issue_node(
+    number: int,
+    author: dict[str, Any] | None,
+    *,
+    title: str | None = None,
+    body: str = "steps to reproduce",
+    state: str = "OPEN",
+    state_reason: str | None = None,
+    created: str = "2026-01-01T00:00:00Z",
+    updated: str | None = None,
+    closed: str | None = None,
+    association: str = "FIRST_TIME_CONTRIBUTOR",
+    labels: Sequence[str] = ("bug",),
+    assignees: Sequence[str] = (),
+    participants: Sequence[str] = (),
+    milestone: str | None = None,
+    reactions: int = 0,
+    comments: Sequence[dict[str, Any]] = (),
+    comments_total: int | None = None,
+) -> dict[str, Any]:
+    """One node of the `IssueDetails` connection."""
+    node = _thread_common(
+        number, author, title=title, body=body, created=created, updated=updated,
+        association=association, labels=labels, reactions=reactions,
+        comments=comments, comments_total=comments_total,
+    )
+    node.update(
+        {
+            "state": state,
+            "stateReason": state_reason,
+            "closedAt": closed,
+            "assignees": {"nodes": [{"login": n} for n in assignees]},
+            "milestone": {"title": milestone} if milestone else None,
+            "participants": {
+                "totalCount": len(participants),
+                "nodes": [{"login": n} for n in participants],
+            },
+        }
+    )
+    return node
+
+
+def pr_node(
+    number: int,
+    author: dict[str, Any] | None,
+    *,
+    state: str = "MERGED",
+    merged: bool = True,
+    merged_at: str | None = "2026-01-05T00:00:00Z",
+    merged_by: str | None = "maintainer",
+    is_draft: bool = False,
+    additions: int = 42,
+    deletions: int = 7,
+    changed_files: int = 3,
+    commits: int = 2,
+    base_ref: str = "master",
+    head_ref: str = "fix/thing",
+    review_decision: str | None = "APPROVED",
+    reviews: Sequence[dict[str, Any]] = (),
+    **kw: Any,
+) -> dict[str, Any]:
+    """One node of the `PullRequestDetails` connection."""
+    node = issue_node(number, author, **kw)
+    node.pop("stateReason", None)
+    node.update(
+        {
+            "state": state,
+            "merged": merged,
+            "mergedAt": merged_at,
+            "mergedBy": {"login": merged_by} if merged_by else None,
+            "isDraft": is_draft,
+            "additions": additions,
+            "deletions": deletions,
+            "changedFiles": changed_files,
+            "commits": {"totalCount": commits},
+            "baseRefName": base_ref,
+            "headRefName": head_ref,
+            "reviewDecision": review_decision,
+            "reviews": connection(nodes=list(reviews)),
+        }
+    )
+    return node
+
+
+def discussion_node(
+    number: int,
+    author: dict[str, Any] | None,
+    *,
+    category: str = "Q&A",
+    upvotes: int = 3,
+    answer_author: dict[str, Any] | None = None,
+    answer_at: str = "2026-01-06T00:00:00Z",
+    **kw: Any,
+) -> dict[str, Any]:
+    """One node of the `DiscussionDetails` connection."""
+    kw.setdefault("association", "NONE")
+    node = _thread_common(
+        number,
+        author,
+        title=kw.pop("title", None),
+        body=kw.pop("body", "how do I configure this?"),
+        created=kw.pop("created", "2026-01-01T00:00:00Z"),
+        updated=kw.pop("updated", None),
+        association=kw.pop("association"),
+        labels=kw.pop("labels", ()),
+        reactions=kw.pop("reactions", 0),
+        comments=kw.pop("comments", ()),
+        comments_total=kw.pop("comments_total", None),
+    )
+    node.update(
+        {
+            "lastEditedAt": None,
+            "upvoteCount": upvotes,
+            "category": {"name": category},
+            "answer": (
+                {"createdAt": answer_at, "author": answer_author} if answer_author else None
+            ),
+        }
+    )
+    return node
+
+
+def thread_body(
+    field: str,
+    nodes: Sequence[dict[str, Any]],
+    *,
+    has_next: bool = False,
+    cursor: str | None = None,
+    total: int | None = None,
+) -> dict[str, Any]:
+    """`repository.<field>` for one of the thread-detail documents."""
+    return {
+        "repository": {
+            "nameWithOwner": "o/r",
+            field: connection(
+                nodes=list(nodes), has_next=has_next, cursor=cursor, total=total
+            ),
+        }
+    }
+
+
+def tail_body(
+    field: str, number: int, comments: Sequence[dict[str, Any]], *, total: int | None = None
+) -> dict[str, Any]:
+    """`repository.<issue|pullRequest|discussion>.comments` -- a tail query response."""
+    return {
+        "repository": {
+            field: {
+                "number": number,
+                "comments": {
+                    "totalCount": total if total is not None else len(comments),
+                    "nodes": list(comments),
+                },
+            }
+        }
+    }

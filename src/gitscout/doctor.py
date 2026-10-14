@@ -20,16 +20,20 @@ import httpx
 from .config import Settings
 from .github_client import GitHubAuthError, GitHubClient
 from .graphql import GraphQLClient, GraphQLError, MissingScopeError
+from .models import THREAD_KINDS
 from .queries import (
     DISCOVER,
     DISCOVER_PATH,
     KIND_QUERIES,
     PROBE_REPO,
+    THREAD_ORDER_CREATED,
+    thread_query,
     VIEWER,
     commit_email_query,
     kind_query,
 )
 from .storage import Store
+from .supabase import TARGETS, PostgresWriter, SupabaseClient, SupabaseError
 
 log = logging.getLogger(__name__)
 
@@ -222,6 +226,40 @@ async def check_graphql(settings: Settings, report: Report, **kw: Any) -> None:
         except Exception as exc:  # noqa: BLE001
             report.add("query: commit emails", FAIL, f"{type(exc).__name__}: {exc}")
 
+        # the thread documents: the heaviest queries gitscout sends, so the point
+        # cost reported here is the number to size a backfill against.
+        for kind in THREAD_KINDS:
+            query, path = thread_query(kind)
+            try:
+                res = await client.execute(
+                    query,
+                    {
+                        "owner": owner,
+                        "name": name,
+                        "first": 2,
+                        "after": None,
+                        "comments": 2,
+                        "order": THREAD_ORDER_CREATED,
+                    },
+                    tolerate_missing=False,
+                )
+                connection = res.pluck(*path)
+                if connection is None:
+                    report.add(
+                        f"query: {kind} detail", FAIL, f"no {'.'.join(path)} in the response"
+                    )
+                    continue
+                nodes = [n for n in (connection.get("nodes") or []) if n]
+                threads = sum(len((n.get("thread") or {}).get("nodes") or []) for n in nodes)
+                report.add(
+                    f"query: {kind} detail",
+                    OK,
+                    f"{connection.get('totalCount')} in repo, read {len(nodes)} with "
+                    f"{threads} comment(s), cost={res.cost}",
+                )
+            except Exception as exc:  # noqa: BLE001
+                report.add(f"query: {kind} detail", FAIL, f"{type(exc).__name__}: {exc}")
+
         # discovery search
         try:
             res = await client.execute(
@@ -240,6 +278,67 @@ async def check_graphql(settings: Settings, report: Report, **kw: Any) -> None:
             f"this check cost {client.points_used} points over {client.queries_sent} queries"
             + (" (some retried without the email field)" if scope_warned else ""),
         )
+
+
+async def check_supabase(settings: Settings, report: Report, **kw: Any) -> None:
+    """Is the mirror configured, reachable, and does it have its tables?
+
+    Off by default: a missing SUPABASE_URL is a PASS, not a warning. Only a
+    configured-but-broken mirror is worth shouting about, because that is the case
+    where a scheduled push is silently failing.
+    """
+    if not settings.supabase_enabled:
+        report.add("supabase mirror", OK, "not configured (local SQLite only)")
+        return
+
+    if settings.supabase_transport == "postgres":
+        # A direct DSN writes without the project's Data API being exposed at all,
+        # so PostgREST being switched off is not an error here.
+        try:
+            with PostgresWriter(settings.supabase_db_url or "") as db:
+                for _name, table, _conflict in TARGETS:
+                    report.add(f"supabase: {table}", OK, f"{db.count(table)} row(s)")
+            report.add("supabase mirror", OK, "direct Postgres (Data API not required)")
+        except SupabaseError as exc:
+            report.add("supabase mirror", FAIL, str(exc))
+        except Exception as exc:  # noqa: BLE001
+            report.add("supabase mirror", FAIL, f"{type(exc).__name__}: {exc}")
+        return
+
+    if settings.supabase_key and settings.supabase_key.count(".") == 2:
+        # A JWT with role=anon cannot write through RLS, and the failure surfaces as a
+        # confusing empty insert rather than a permission error.
+        import base64
+        import json as _json
+
+        try:
+            payload = settings.supabase_key.split(".")[1]
+            claims = _json.loads(base64.urlsafe_b64decode(payload + "=" * (-len(payload) % 4)))
+            if claims.get("role") and claims["role"] != "service_role":
+                report.add(
+                    "supabase key",
+                    WARN,
+                    f"this key has role={claims['role']!r}; RLS is on, so pushes will "
+                    "be rejected. Use the service_role key.",
+                )
+            else:
+                report.add("supabase key", OK, "service_role")
+        except Exception:  # noqa: BLE001
+            report.add("supabase key", OK, "present (could not read its role)")
+
+    try:
+        async with SupabaseClient(
+            settings.supabase_url or "",
+            settings.supabase_key or "",
+            schema=settings.supabase_schema,
+        ) as client:
+            for _name, table, _conflict in TARGETS:
+                count = await client.count(table)
+                report.add(f"supabase: {table}", OK, f"reachable, {count} row(s)")
+    except SupabaseError as exc:
+        report.add("supabase mirror", FAIL, str(exc))
+    except Exception as exc:  # noqa: BLE001
+        report.add("supabase mirror", FAIL, f"{type(exc).__name__}: {exc}")
 
 
 async def check_apify(settings: Settings, report: Report, http: httpx.AsyncClient | None = None) -> None:
@@ -292,6 +391,9 @@ async def run_doctor(
     await check_rest(settings, report, **kw)
     await check_graphql(settings, report, **kw)
     await check_apify(settings, report, http=http)
+    # The mirror is the one check that is useful even without a GitHub token, but it
+    # sits here so an --offline run stays genuinely offline.
+    await check_supabase(settings, report)
     return report
 
 

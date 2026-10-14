@@ -5,6 +5,11 @@ import asyncio
 
 import httpx
 from gqlhelpers import (
+    comment,
+    discussion_node,
+    issue_node,
+    pr_node,
+    thread_body,
     DEFAULT_RATE_LIMIT,
     authored_body,
     commit_probe,
@@ -91,6 +96,19 @@ def _healthy_transport():
         "Contributors": contribs_body([repo_commit("f@acme.dev", user=gql_user("f"))], total=3),
         "CommitEmails": {"u0": commit_probe("tester", repos=[[]])},
         "Discover": {"search": connection(nodes=[], total=12)},
+        "IssueDetails": thread_body(
+            "issues",
+            [issue_node(1, gql_user("c"), comments=[comment("c1", gql_user("g"))])],
+            total=4,
+        ),
+        "PullRequestDetails": thread_body(
+            "pullRequests",
+            [pr_node(1, gql_user("d"), comments=[comment("c2", gql_user("g"))])],
+            total=9,
+        ),
+        "DiscussionDetails": thread_body(
+            "discussions", [discussion_node(1, gql_user("e"))], total=2
+        ),
     }
 
     def handler(request: httpx.Request) -> httpx.Response:
@@ -119,6 +137,10 @@ def test_healthy_live_report_passes_every_query(tmp_path):
         assert status_of(report, f"query: {kind}") == OK
     assert status_of(report, "query: commit emails") == OK
     assert status_of(report, "query: discover") == OK
+    for section in ("issues", "prs", "discussions"):
+        assert status_of(report, f"query: {section} detail") == OK, section
+    detail = next(c.detail for c in report.checks if c.name == "query: issues detail")
+    assert "read 1 with 1 comment(s)" in detail
     assert "tester" in next(c.detail for c in report.checks if c.name == "graphql auth")
     assert "totalCount=7" in next(c.detail for c in report.checks if c.name == "query: stars")
 
@@ -257,6 +279,17 @@ def test_a_missing_read_user_scope_is_a_warning_not_a_schema_failure(tmp_path):
             "Contributors": contribs_body([repo_commit("f@acme.dev", user=gql_user("f"))], total=3),
             "CommitEmails": {"u0": commit_probe("tester", repos=[[]])},
             "Discover": {"search": connection(nodes=[], total=12)},
+            "IssueDetails": thread_body(
+                "issues",
+                [issue_node(1, gql_user("c"), comments=[comment("c1", gql_user("g"))])],
+                total=4,
+            ),
+            "PullRequestDetails": thread_body(
+                "pullRequests", [pr_node(1, gql_user("d"))], total=9
+            ),
+            "DiscussionDetails": thread_body(
+                "discussions", [discussion_node(1, gql_user("e"))], total=2
+            ),
         }
         data = dict(bodies.get(name, {}))
         data["rateLimit"] = DEFAULT_RATE_LIMIT

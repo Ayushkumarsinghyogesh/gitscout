@@ -21,6 +21,9 @@ dependencies = [
 
 [project.optional-dependencies]
 dev = ["pytest>=8"]
+# Only needed for `gitscout supabase push` against a project whose Data API
+# is not exposed. The REST path needs nothing extra.
+postgres = ["psycopg[binary]>=3.1"]
 
 [project.scripts]
 gitscout = "gitscout.cli:app"
@@ -29,7 +32,7 @@ gitscout = "gitscout.cli:app"
 where = ["src"]
 
 [tool.setuptools.package-data]
-gitscout = ["profiles/*.toml"]
+gitscout = ["profiles/*.toml", "*.sql"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]

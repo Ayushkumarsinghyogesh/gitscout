@@ -16,6 +16,11 @@ from gqlhelpers import (
     gql_bot,
     gql_org,
     gql_user,
+    comment,
+    discussion_node,
+    issue_node,
+    pr_node,
+    thread_body,
     op_name,
     stars_body,
     watch_event,
@@ -25,6 +30,7 @@ from typer.testing import CliRunner
 from gitscout.cli import app
 from gitscout.config import Settings
 from gitscout.pipeline import run_scout, targets_for
+from gitscout.storage import Store
 from gitscout.targets import targets_from_repos
 
 runner = CliRunner()
@@ -397,3 +403,70 @@ def test_cli_explains_how_stars_is_collected(tmp_path, monkeypatch):
     )
     assert "events API" in res.output
     assert "300 repo events" in res.output  # the limitation is stated, not hidden
+
+
+def test_scout_with_threads_runs_the_extra_stage_and_fills_the_summary_columns(gql, tmp_path):
+    """`--with-threads` adds the thread stage; without it, nothing extra is fetched."""
+    gql.add("Issues", authored_body("issues", [(gql_user("dave"), "2024-04-01T00:00:00Z")]))
+    gql.add(
+        "IssueDetails",
+        thread_body(
+            "issues",
+            [
+                issue_node(
+                    1,
+                    gql_user("dave"),
+                    title="Scanner misses GovCloud",
+                    labels=("bug",),
+                    comments=[comment("c1", gql_user("erin"), body="same here")],
+                )
+            ],
+            total=1,
+        ),
+    )
+    gql.add("PullRequestDetails", thread_body("pullRequests", []))
+    gql.add("DiscussionDetails", thread_body("discussions", []))
+    gql.add("CommitEmails", {})
+
+    out = tmp_path / "leads.csv"
+    settings = Settings(tokens=("tok",), db_path=str(tmp_path / "t.db"))
+    targets = targets_from_repos(["o/r"], ("issues",))
+
+    result = run(
+        run_scout(
+            settings, targets, outputs=[out], with_threads=True, transport=gql.transport
+        )
+    )
+
+    assert result.threads.new == 1
+    assert result.threads.comments_new == 1
+    assert result.points == (
+        result.ingest.points + result.threads.points + result.enrich.points
+    )
+
+    rows = {r["login"]: r for r in csv.DictReader(out.open(encoding="utf-8"))}
+    assert rows["dave"]["issues_authored"] == "1"
+    assert rows["dave"]["issues_commented"] == "0"
+    assert rows["dave"]["last_issue_at"] == "2026-01-01T00:00:00Z"
+
+    with Store(settings.db_path) as store:
+        involved = {(r["login"], r["role"]) for r in store.thread_rows()}
+    # erin only commented -- she has no `interactions` row, so she is absent from the
+    # lead export but present in the issue export, which is the honest answer
+    assert involved == {("dave", "author"), ("erin", "commenter")}
+    assert "erin" not in rows
+
+
+def test_scout_without_the_flag_sends_no_thread_query(gql, tmp_path):
+    gql.add("Issues", authored_body("issues", [(gql_user("dave"), "2024-04-01T00:00:00Z")]))
+    gql.add("CommitEmails", {})
+    settings = Settings(tokens=("tok",), db_path=str(tmp_path / "t.db"))
+
+    result = run(
+        run_scout(
+            settings, targets_from_repos(["o/r"], ("issues",)), transport=gql.transport
+        )
+    )
+
+    assert "IssueDetails" not in gql.ops()
+    assert result.threads.results == []

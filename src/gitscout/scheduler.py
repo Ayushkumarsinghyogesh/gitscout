@@ -83,10 +83,6 @@ class WatchState:
         self.history.append(result)
 
 
-def next_run_at(seconds: float, *, now: datetime | None = None) -> datetime:
-    return (now or datetime.now(timezone.utc)) + timedelta(seconds=seconds)
-
-
 async def run_once(
     settings: Settings,
     targets: Sequence[Target],

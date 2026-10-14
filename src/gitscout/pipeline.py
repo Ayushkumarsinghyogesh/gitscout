@@ -19,7 +19,14 @@ from .graphql import GraphQLClient
 from .ingest import IngestResult, ingest_kind, parse_repo
 from .ingest_events import ingest_stars_via_events
 from .ingest_gql import EmailScope, GqlIngestResult, IngestTotals, ingest_repos_gql
-from .models import ALL_KINDS, KINDS, Target
+from .threads_gql import (
+    DEFAULT_COMMENTS,
+    DEFAULT_PAGE_SIZE,
+    ThreadTotals,
+    harvest_repos,
+    resolve_participants,
+)
+from .models import ALL_KINDS, KINDS, THREAD_KINDS, Target
 from .providers import load_providers, run_providers
 from .scoring import rescore
 from .storage import Store
@@ -139,6 +146,9 @@ class ScoutResult:
 
     run_id: int | None = None
     ingest: IngestTotals = field(default_factory=IngestTotals)
+    threads: ThreadTotals = field(default_factory=ThreadTotals)
+    participants_resolved: int = 0
+    participant_emails: int = 0
     enrich: EnrichGqlSummary = field(default_factory=EnrichGqlSummary)
     provider_hits: int = 0
     provider_calls: int = 0
@@ -151,11 +161,16 @@ class ScoutResult:
 
     @property
     def points(self) -> int:
-        return self.ingest.points + self.enrich.points
+        return self.ingest.points + self.enrich.points + self.threads.points
 
     @property
     def emails_new(self) -> int:
-        return self.ingest.emails_new + self.enrich.emails_new + self.provider_hits
+        return (
+            self.ingest.emails_new
+            + self.enrich.emails_new
+            + self.provider_hits
+            + self.participant_emails
+        )
 
     @property
     def exported(self) -> int:
@@ -212,6 +227,11 @@ async def run_scout(
     min_confidence: float = 0.0,
     new_only: bool = False,
     mode: str = "scout",
+    with_threads: bool = False,
+    thread_kinds: Sequence[str] = THREAD_KINDS,
+    thread_comments: int = DEFAULT_COMMENTS,
+    thread_page_size: int = DEFAULT_PAGE_SIZE,
+    thread_tails: int = 0,
     transport: httpx.AsyncBaseTransport | None = None,
     http: httpx.AsyncClient | None = None,
     host_check: HostCheck = is_public_host,
@@ -276,6 +296,32 @@ async def run_scout(
                 finally:
                     if rest is not None:
                         await rest.aclose()
+
+                if with_threads and repo_list:
+                    # After ingest on purpose: a thread author the interaction crawl
+                    # just discovered already has a `users` row by the time the
+                    # thread export joins against it.
+                    result.threads = await harvest_repos(
+                        client,
+                        store,
+                        repo_list,
+                        thread_kinds,
+                        max_items=max_items,
+                        comments=thread_comments,
+                        page_size=thread_page_size,
+                        incremental=incremental,
+                        fresh=fresh,
+                        tails=thread_tails,
+                    )
+                    # Before enrichment, not after: someone whose only trace is a
+                    # comment has no profile, so the email stages would skip them
+                    # entirely. Looking them up here puts them in the same queue as
+                    # everyone else.
+                    looked, _written, found = await resolve_participants(
+                        client, store, scope=scope
+                    )
+                    result.participants_resolved = looked
+                    result.participant_emails = found
 
                 if enrich:
                     scanner = (

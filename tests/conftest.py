@@ -128,3 +128,25 @@ def store():
 
     with Store(":memory:") as s:
         yield s
+
+
+#: Every variable `load_settings` reads. A developer's real `.env` must never decide
+#: whether a test passes -- before this, adding SUPABASE_URL locally broke two tests
+#: that assert the unconfigured behaviour.
+_LEAKY_ENV = (
+    "GITHUB_TOKEN", "GITHUB_TOKENS", "GITSCOUT_DB", "GITSCOUT_TARGETS",
+    "GITSCOUT_SCHEDULE", "GITSCOUT_CONCURRENCY", "GITSCOUT_PAGE_SIZE",
+    "GITSCOUT_COMMIT_BATCH", "GITSCOUT_COMMITS_PER_REPO", "GITSCOUT_REPOS_PER_USER",
+    "GITSCOUT_PROVIDER_BUDGET", "HUNTER_API_KEY", "APIFY_TOKEN", "APIFY_ACTOR",
+    "SUPABASE_URL", "SUPABASE_KEY", "SUPABASE_SERVICE_KEY", "SUPABASE_SCHEMA",
+    "SUPABASE_BATCH", "SUPABASE_DB_URL", "DATABASE_URL", "SUPABASE_DB_PASSWORD",
+    "SUPABASE_PROJECT_REF", "SUPABASE_DB_HOST", "SUPABASE_DB_PORT",
+)
+
+
+@pytest.fixture(autouse=True)
+def _isolate_environment(monkeypatch):
+    """Run every test as if there were no .env and no exported credentials."""
+    monkeypatch.setattr("gitscout.config.load_dotenv", lambda *a, **kw: False)
+    for name in _LEAKY_ENV:
+        monkeypatch.delenv(name, raising=False)
