@@ -93,6 +93,10 @@ class SyncResult:
     seconds: float = 0.0
     watermark: str | None = None
     dry_run: bool = False
+    refreshed: bool = False
+    outreach_rows: int | None = None
+    outreach_views: list[str] = field(default_factory=list)
+    refresh_error: str | None = None
 
     @property
     def rows(self) -> int:
@@ -334,7 +338,7 @@ class PostgresWriter:
                 chunk = rows[start : start + self.batch]
                 values: list[Any] = []
                 for row in chunk:
-                    values.extend(row.get(c) for c in columns)
+                    values.extend(_adapt(row.get(c)) for c in columns)
                 sql = head + ", ".join([placeholders] * len(chunk)) + tail
                 try:
                     cur.execute(sql, values)
@@ -352,15 +356,40 @@ class PostgresWriter:
             for row in rows:
                 cur.execute(
                     f"INSERT INTO {table} ({', '.join(columns)}) VALUES {placeholders}",
-                    [row.get(c) for c in columns],
+                    [_adapt(row.get(c)) for c in columns],
                 )
                 self.statements += 1
         return len(rows)
+
+    def scalar(self, sql: str, params: Sequence[Any] = ()) -> Any:
+        """Run one statement and return the first column of its first row."""
+        with self._conn.cursor() as cur:
+            try:
+                cur.execute(sql, list(params))
+            except Exception as exc:  # noqa: BLE001
+                raise SupabaseError(_redact(str(exc))) from exc
+            self.statements += 1
+            row = cur.fetchone()
+            return row[0] if row else None
 
     def count(self, table: str) -> int:
         with self._conn.cursor() as cur:
             cur.execute(f"SELECT count(*) FROM {table}")
             return int(cur.fetchone()[0])
+
+
+def _adapt(value: Any) -> Any:
+    """psycopg adapts lists to arrays but not dicts to jsonb -- wrap those explicitly.
+
+    `activity_hours_utc` is the only dict-valued column; without this the direct path
+    fails on its first person. Lists of dicts would be jsonb too, but no mirror column
+    holds one.
+    """
+    if isinstance(value, dict):
+        from psycopg.types.json import Jsonb
+
+        return Jsonb(value)
+    return value
 
 
 def _redact(message: str) -> str:
@@ -457,6 +486,14 @@ async def push(
         mode="full" if full else "incremental", since=since, dry_run=dry_run
     )
 
+    if settings.supabase_transport == "postgres" and not dry_run:
+        _push_postgres(
+            settings, store, result,
+            full=full, since=since, only_with_email=only_with_email, limit=limit,
+        )
+        result.seconds = round(time.monotonic() - started, 2)
+        return result
+
     payload = collect(store, since, only_with_email=only_with_email, limit=limit)
     result.counts = {name: len(rows) for name, rows in payload.items()}
     result.watermark = watermark_of(payload)
@@ -467,12 +504,6 @@ async def push(
     if not result.rows:
         log.info("supabase: nothing new to push")
         result.seconds = round(time.monotonic() - started, 2)
-        return result
-
-    if settings.supabase_transport == "postgres":
-        _push_postgres(settings, result, payload)
-        if result.watermark:
-            store.set_crawl_state(SYNC_KEY, high_water=result.watermark)
         return result
 
     async with SupabaseClient(
@@ -504,42 +535,121 @@ async def push(
     return result
 
 
-def _push_postgres(
-    settings: Settings, result: SyncResult, payload: Mapping[str, Sequence[Mapping[str, Any]]]
-) -> None:
-    """The direct-Postgres branch of `push`.
+#: Set while the outreach dataset is behind the mirror. A refresh that fails leaves
+#: it set, so the next run refreshes even if it brings no new data.
+REFRESH_KEY = "supabase:refresh"
 
-    One transaction for the whole mirror: either every table lands or none does, so a
-    failure can never leave children without their parents. The REST path cannot
-    offer that -- PostgREST commits per request -- which is the other reason to
-    prefer this transport where it is available.
+_IDENTIFIER = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")
+
+
+def _schema(settings: Settings) -> str:
+    schema = settings.supabase_schema or DEFAULT_SCHEMA
+    if not _IDENTIFIER.match(schema):
+        raise SupabaseError(f"SUPABASE_SCHEMA must be a plain identifier (got {schema!r})")
+    return schema
+
+
+def _readers(store: Store) -> dict[str, Any]:
+    """Whole-table readers, for a full push that streams one table at a time."""
+    return {
+        "repositories": store.sync_repositories,
+        "people": lambda: store.sync_leads(None),
+        "person_emails": lambda: store.sync_emails(None),
+        "threads": lambda: store.sync_threads(None),
+        "comments": lambda: store.sync_thread_comments(None),
+        "interactions": lambda: store.sync_interactions(None),
+    }
+
+
+def _push_postgres(
+    settings: Settings,
+    store: Store,
+    result: SyncResult,
+    *,
+    full: bool,
+    since: str | None,
+    only_with_email: bool,
+    limit: int,
+) -> None:
+    """The direct-Postgres push: the production path for scheduled runs.
+
+    1. Every table lands in ONE transaction, parents before children, or none does.
+    2. Only after that commits: per-repository views are ensured and the outreach
+       dataset is refreshed, in a second transaction. A failed refresh never rolls
+       back data that arrived correctly; it is remembered and retried next run.
+
+    A full push streams one table at a time instead of holding the mirror in memory
+    -- every parent is in the push by definition, so no orphan check is needed.
     """
-    started = time.monotonic()
-    with PostgresWriter(settings.supabase_db_url or "", batch=settings.supabase_batch) as db:
-        try:
+    schema = _schema(settings)
+    dsn = settings.supabase_db_url or ""
+    streaming = full and not only_with_email and not limit
+    marks: list[str] = []
+
+    with PostgresWriter(dsn, batch=settings.supabase_batch) as db:
+        if streaming:
+            readers = _readers(store)
+            for name, table, conflict in TARGETS:
+                rows = readers[name]()
+                result.counts[name] = len(rows)
+                mark = watermark_of({name: rows})
+                if mark:
+                    marks.append(mark)
+                if rows:
+                    db.upsert(f"{schema}.{table}", _prepare(name, rows), on_conflict=conflict)
+                del rows
+        else:
+            payload = collect(store, since, only_with_email=only_with_email, limit=limit)
+            result.counts = {name: len(rows) for name, rows in payload.items()}
+            mark = watermark_of(payload)
+            if mark:
+                marks.append(mark)
             for name, table, conflict in TARGETS:
                 rows = _prepare(name, payload[name])
                 if rows:
-                    db.upsert(table, rows, on_conflict=conflict)
-            db.upsert(
-                "sync_runs",
-                [
-                    {
-                        "mode": result.mode,
-                        "since": result.since,
-                        "people": result.counts.get("people", 0),
-                        "person_emails": result.counts.get("person_emails", 0),
-                        "threads": result.counts.get("threads", 0),
-                        "comments": result.counts.get("comments", 0),
-                        "seconds": round(time.monotonic() - started, 2),
-                        "status": "ok",
-                    }
-                ],
-                on_conflict="id",
-            )
-        finally:
-            result.requests = db.statements
-            result.seconds = round(time.monotonic() - started, 2)
+                    db.upsert(f"{schema}.{table}", rows, on_conflict=conflict)
+        db.upsert(
+            f"{schema}.sync_runs",
+            [{
+                "mode": result.mode,
+                "since": result.since,
+                "people": result.counts.get("people", 0),
+                "person_emails": result.counts.get("person_emails", 0),
+                "threads": result.counts.get("threads", 0),
+                "comments": result.counts.get("comments", 0),
+                "status": "ok",
+            }],
+            on_conflict="id",
+        )
+        result.requests = db.statements
+    # ---- committed. Only now may the watermark move.
+    result.watermark = max(marks) if marks else None
+    if result.watermark:
+        store.set_crawl_state(SYNC_KEY, high_water=result.watermark)
+
+    # The registry is re-sent on every run by design, so it is not evidence of a
+    # change; rebuilding the dataset because one unchanged row was upserted is load.
+    changed = result.rows - result.counts.get("repositories", 0) > 0
+    pending = (store.get_crawl_state(REFRESH_KEY) or {}).get("done") is False
+    if not (changed or pending):
+        log.info("supabase: no data changed; outreach dataset left as is")
+        return
+
+    store.set_crawl_state(REFRESH_KEY, done=False)
+    try:
+        with PostgresWriter(dsn) as db:
+            for repo in store.sync_repositories():
+                result.outreach_views.append(
+                    db.scalar(f"select {schema}.ensure_outreach_view(%s)", [repo["repo"]])
+                )
+            result.outreach_rows = db.scalar(f"select {schema}.refresh_outreach()")
+            result.requests += db.statements
+        store.set_crawl_state(REFRESH_KEY, done=True)
+        result.refreshed = True
+    except SupabaseError as exc:
+        # Data is safe and committed; the previous dataset keeps being served.
+        result.refresh_error = str(exc)
+        log.warning("supabase: outreach refresh failed, will retry next run: %s", exc)
 
 
 async def _log_run(

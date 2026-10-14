@@ -416,3 +416,150 @@ def test_raw_signals_and_the_registry_are_mirrored(seeded, settings):
     signals = rest.bodies("interactions")
     assert {(s["login"], s["kind"]) for s in signals} == {("alice", "issues"), ("bob", "forks")}
     assert "first_recorded_at" in signals[0] and "added_at" not in signals[0]
+
+
+# ------------------------------------------------- the direct-Postgres push path
+
+import gitscout.supabase as sup  # noqa: E402
+from gitscout.supabase import REFRESH_KEY, _adapt  # noqa: E402
+
+
+class FakeWriter:
+    """Stands in for PostgresWriter: records every upsert and function call."""
+
+    log: list = []
+    fail_on: str | None = None   # "upsert" or "refresh"
+
+    def __init__(self, dsn, *, batch=500, connect_timeout=15):
+        self.statements = 0
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, exc_type, *_):
+        FakeWriter.log.append(("commit" if exc_type is None else "rollback",))
+        return False
+
+    def upsert(self, table, rows, *, on_conflict):
+        if FakeWriter.fail_on == "upsert" and table.endswith(".threads"):
+            raise SupabaseError("threads: simulated failure")
+        FakeWriter.log.append(("upsert", table, len(rows), on_conflict))
+        self.statements += 1
+        return len(rows)
+
+    def scalar(self, sql, params=()):
+        FakeWriter.log.append(("call", sql, tuple(params)))
+        self.statements += 1
+        if "refresh_outreach" in sql:
+            if FakeWriter.fail_on == "refresh":
+                raise SupabaseError("simulated refresh failure")
+            return 4231
+        return "final_outreach_users_" + params[0].split("/")[1]
+
+
+@pytest.fixture
+def pg(monkeypatch, settings):
+    FakeWriter.log = []
+    FakeWriter.fail_on = None
+    monkeypatch.setattr(sup, "PostgresWriter", FakeWriter)
+    return Settings(
+        tokens=("tok",), db_path=settings.db_path,
+        supabase_db_url="postgresql://gitscout_writer.ref:x@host:6543/postgres",
+        supabase_schema="gitscout",
+    )
+
+
+def _register(store):
+    store.upsert_repository({
+        "repo": "o/r", "repository_id": 42, "node_id": "R_1", "owner": "o", "name": "r",
+        "url": "https://github.com/o/r", "description": None, "homepage": None,
+        "stars": 10, "forks": 2, "language": "Go", "topics": "[]", "is_archived": 0,
+    })
+
+
+def test_a_full_postgres_push_lands_everything_then_refreshes(seeded, pg):
+    _register(seeded)
+    result = run(push(pg, seeded, full=True))
+
+    upserts = [e for e in FakeWriter.log if e[0] == "upsert"]
+    tables = [e[1] for e in upserts]
+    # schema-qualified, registry first, parents before children, audit row last
+    assert tables[0] == "gitscout.repositories" and tables[-1] == "gitscout.sync_runs"
+    assert tables.index("gitscout.people") < tables.index("gitscout.person_emails")
+    assert tables.index("gitscout.threads") < tables.index("gitscout.comments")
+    # data commits BEFORE any view or refresh call
+    first_call = next(i for i, e in enumerate(FakeWriter.log) if e[0] == "call")
+    assert ("commit",) in FakeWriter.log[:first_call]
+    calls = [e[1] for e in FakeWriter.log if e[0] == "call"]
+    assert calls == ["select gitscout.ensure_outreach_view(%s)", "select gitscout.refresh_outreach()"]
+    assert result.refreshed and result.outreach_rows == 4231
+    assert result.outreach_views == ["final_outreach_users_r"]
+    assert seeded.get_crawl_state(SYNC_KEY)["high_water"] == result.watermark
+    assert seeded.get_crawl_state(REFRESH_KEY)["done"] is True
+
+
+def test_an_unchanged_run_does_not_rebuild_the_dataset(seeded, pg):
+    _register(seeded)
+    run(push(pg, seeded, full=True))
+    FakeWriter.log = []
+
+    result = run(push(pg, seeded))
+
+    assert result.counts["repositories"] == 1 and result.rows == 1  # registry only
+    assert not [e for e in FakeWriter.log if e[0] == "call"]
+    assert not result.refreshed and result.refresh_error is None
+
+
+def test_a_failed_refresh_keeps_the_data_and_is_retried_next_run(seeded, pg):
+    _register(seeded)
+    FakeWriter.fail_on = "refresh"
+    first = run(push(pg, seeded, full=True))
+
+    # data landed and the watermark moved: the failure was only the rebuild
+    assert first.refresh_error and not first.refreshed
+    assert seeded.get_crawl_state(SYNC_KEY)["high_water"] == first.watermark
+    assert seeded.get_crawl_state(REFRESH_KEY)["done"] is False
+
+    # next run brings no new data, but the pending refresh is retried
+    FakeWriter.fail_on = None
+    FakeWriter.log = []
+    second = run(push(pg, seeded))
+    assert second.rows == 1 and second.refreshed
+    assert seeded.get_crawl_state(REFRESH_KEY)["done"] is True
+
+
+def test_a_failed_data_push_moves_nothing(seeded, pg):
+    _register(seeded)
+    FakeWriter.fail_on = "upsert"
+    with pytest.raises(SupabaseError):
+        run(push(pg, seeded, full=True))
+
+    assert ("rollback",) in FakeWriter.log
+    assert not [e for e in FakeWriter.log if e[0] == "call"]  # no refresh of half data
+    assert seeded.get_crawl_state(SYNC_KEY) is None
+
+
+def test_dicts_become_jsonb_and_everything_else_passes_through():
+    # psycopg is the optional `postgres` extra; CI installs it, a minimal install may not.
+    Jsonb = pytest.importorskip("psycopg.types.json").Jsonb
+
+    assert isinstance(_adapt({"9": 4}), Jsonb)
+    assert _adapt(["a", "b"]) == ["a", "b"]
+    assert _adapt(None) is None and _adapt(3) == 3
+
+
+def test_a_schema_name_is_never_interpolated_unchecked(seeded, pg):
+    bad = Settings(tokens=("tok",), db_path=pg.db_path, supabase_db_url=pg.supabase_db_url,
+                   supabase_schema="gitscout; drop table x")
+    with pytest.raises(SupabaseError, match="plain identifier"):
+        run(push(bad, seeded, full=True))
+
+
+def test_the_mirror_defaults_to_its_own_schema_not_public():
+    """Regression: the default stayed "public" while every table lived in "gitscout",
+    so the CLI push targeted relations that do not exist."""
+    from gitscout.config import Settings, load_settings
+    from gitscout.supabase import DEFAULT_SCHEMA
+
+    assert Settings().supabase_schema == DEFAULT_SCHEMA == "gitscout"
+    assert load_settings().supabase_schema == "gitscout"

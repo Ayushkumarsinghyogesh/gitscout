@@ -31,7 +31,7 @@ from gitscout.cli import app
 from gitscout.config import Settings
 from gitscout.pipeline import run_scout, targets_for
 from gitscout.storage import Store
-from gitscout.targets import targets_from_repos
+from gitscout.targets import load_targets, targets_from_repos
 
 runner = CliRunner()
 
@@ -178,10 +178,13 @@ def test_no_enrich_skips_the_commit_probe(gql, tmp_path):
 
 
 def test_targets_for_merges_profiles_and_cli_repos_without_duplicates():
-    targets = targets_for(["o/extra"], ("stars",), "cloud-security")
+    # The profile is the live repository list; read it rather than hard-coding a repo
+    # that may be commented out next week.
+    shipped = [t.repo for t in load_targets("cloud-security")]
+    targets = targets_for(["o/extra", shipped[0]], ("stars",), "cloud-security")
     repos = [t.repo for t in targets]
-    assert "o/extra" in repos and "prowler-cloud/prowler" in repos
-    assert len(repos) == len(set(repos))
+    assert "o/extra" in repos and set(shipped) <= set(repos)
+    assert len(repos) == len(set(repos))  # shipped[0] was given twice, kept once
 
     with pytest.raises(ValueError, match="nothing to scout"):
         targets_for([], ("stars",), None)
@@ -223,7 +226,8 @@ def test_cli_targets_list_shows_the_shipped_profile():
     assert res.exit_code == 0 and "cloud-security" in res.output
 
     res = runner.invoke(app, ["targets-list", "--targets", "cloud-security"])
-    assert res.exit_code == 0 and "prowler-cloud/prowler" in res.output
+    shipped = [t.repo for t in load_targets("cloud-security")]
+    assert res.exit_code == 0 and all(repo in res.output for repo in shipped)
 
 
 def test_cli_doctor_offline_exits_nonzero_without_a_token(tmp_path, monkeypatch):

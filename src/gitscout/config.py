@@ -38,7 +38,7 @@ class Settings:
     #: -- Supabase warns about this in its own reset dialog. Pasting the raw password
     #: removes that whole class of mistake.
     supabase_db_url: str | None = None
-    supabase_schema: str = "public"
+    supabase_schema: str = "gitscout"
     supabase_batch: int = 500
 
     # --- optional third-party providers (all disabled unless a key is present)
@@ -146,7 +146,7 @@ def load_settings(db_path: str | None = None) -> Settings:
         # SUPABASE_SERVICE_KEY is the documented name; SUPABASE_KEY is accepted because
         # that is what the Supabase dashboard copy button calls it.
         supabase_key=_clean("SUPABASE_SERVICE_KEY") or _clean("SUPABASE_KEY"),
-        supabase_schema=_clean("SUPABASE_SCHEMA") or "public",
+        supabase_schema=_clean("SUPABASE_SCHEMA") or "gitscout",
         supabase_batch=max(1, min(5000, _int("SUPABASE_BATCH", 500))),
         hunter_api_key=_clean("HUNTER_API_KEY"),
         apify_token=_clean("APIFY_TOKEN"),

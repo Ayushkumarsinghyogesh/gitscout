@@ -12,3 +12,5 @@ __pycache__/
 .pytest_cache/
 note.txt
 personaldocs.txt
+logs/
+*.db.lock

@@ -4,6 +4,7 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
+from contextlib import nullcontext
 from pathlib import Path
 from typing import Annotated, Optional, Sequence
 
@@ -43,6 +44,7 @@ from .pipeline import (
     targets_for,
 )
 from .scoring import rescore
+from .lock import RunLocked, run_lock
 from .storage import Store
 from .supabase import (
     SYNC_KEY,
@@ -246,11 +248,52 @@ def scout(
     sections: SectionsOpt = None,
     thread_comments: CommentsOpt = DEFAULT_COMMENTS,
     thread_tails: TailsOpt = 0,
+    with_social: Annotated[bool, typer.Option("--with-social", help="Also fetch the LinkedIn link and public repo count people publish (~1 point / 25 people)")] = False,
+    push: Annotated[bool, typer.Option("--push", help="Then register the repos, push to Supabase and refresh the outreach dataset. Holds a run lock.")] = False,
 ) -> None:
-    """GraphQL pipeline: ingest -> email discovery -> score -> export. The main command."""
+    """GraphQL pipeline: ingest -> email discovery -> score -> export. The main command.
+
+    The scheduled run is one invocation of this:
+
+        gitscout scout -t cloud-security --incremental --with-threads --with-social --push
+
+    Adding a repository to the profile is all it takes to bring it into the next run.
+    """
     settings = _settings(ctx)
     _require_token(settings)
+    if push and settings.supabase_transport != "postgres":
+        raise typer.BadParameter(
+            "--push needs SUPABASE_DB_URL (the gitscout_writer login); see "
+            "docs/ingestion-and-scheduling.md"
+        )
     target_list = _run_sync_targets(repos or [], _kinds(kinds), targets, kinds is not None)
+
+    lock = run_lock(settings.db_path) if push else nullcontext()
+    try:
+        with lock:
+            _scout_once(
+                settings, target_list,
+                max_items=max_items, fresh=fresh, incremental=incremental,
+                no_enrich=no_enrich, limit=limit, scan_websites=scan_websites,
+                no_providers=no_providers, out=out, new_only=new_only,
+                only_with_email=only_with_email, min_confidence=min_confidence,
+                with_threads=with_threads, sections=sections,
+                thread_comments=thread_comments, thread_tails=thread_tails,
+                with_social=with_social, push=push,
+            )
+    except RunLocked as exc:
+        typer.secho(str(exc), fg=typer.colors.YELLOW, err=True)
+        raise typer.Exit(3) from exc
+
+
+def _scout_once(
+    settings: Settings,
+    target_list,
+    *,
+    max_items, fresh, incremental, no_enrich, limit, scan_websites, no_providers,
+    out, new_only, only_with_email, min_confidence, with_threads, sections,
+    thread_comments, thread_tails, with_social, push,
+) -> None:
     result = _run(
         run_scout(
             settings,
@@ -274,6 +317,35 @@ def scout(
         )
     )
     _report_scout(result)
+
+    if not (with_social or push):
+        return
+
+    async def extras():
+        with Store(settings.db_path) as store:
+            async with GraphQLClient(settings.tokens, user_agent=settings.user_agent) as client:
+                social = await resolve_social(client, store) if with_social else None
+                # The registry carries each repository's stable id; views need it.
+                repos = [await fetch_repo_info(client, store, t.repo) for t in target_list] if push else []
+                return social, repos, client.points_used
+
+    social, repos, points = _run(extras())
+    if social:
+        typer.echo(f"social:  {social[0]} looked up, {social[1]} LinkedIn links")
+    if push:
+        typer.echo(f"registry: {', '.join(r['repo'] for r in repos if r)} ({points} points incl. social)")
+        with Store(settings.db_path) as store:
+            try:
+                pushed = _run(supabase_push_rows(settings, store))
+            except SupabaseError as exc:
+                typer.secho(f"Supabase push failed: {exc}", fg=typer.colors.RED, err=True)
+                raise typer.Exit(1) from exc
+        typer.echo(
+            f"pushed:  {pushed.rows} rows "
+            + ", ".join(f"{k}={v}" for k, v in pushed.counts.items() if v)
+            + f" in {pushed.seconds}s"
+        )
+        _report_refresh(pushed)
 
 
 def _run_sync_targets(
@@ -845,8 +917,26 @@ def supabase_push(
     if not result.dry_run:
         typer.echo(f"requests:  {result.requests} in {result.seconds}s")
         typer.echo(f"watermark: {result.watermark or '(unchanged)'}")
+        _report_refresh(result)
     elif result.watermark:
         typer.echo(f"watermark would move to: {result.watermark}")
+
+
+def _report_refresh(result) -> None:
+    if result.refreshed:
+        typer.echo(
+            f"outreach:  refreshed, {result.outreach_rows} rows; "
+            f"views {', '.join(result.outreach_views)}"
+        )
+    elif result.refresh_error:
+        typer.secho(
+            f"outreach:  refresh FAILED, previous dataset still served; retried next run "
+            f"({result.refresh_error})",
+            fg=typer.colors.YELLOW,
+            err=True,
+        )
+    else:
+        typer.echo("outreach:  unchanged (no new data)")
 
 
 @supabase_app.command("status")

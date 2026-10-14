@@ -18,18 +18,23 @@
 #
 # Run it with:  gitscout scout --targets targets/cloud-security.toml
 
+# ACTIVE TARGETS -- this file is the scheduled run's repository list.
+# Uncomment a [[target]] block (or add one) and the next scheduled run picks it up:
+# it is registered, crawled from scratch, pushed, and gets its own
+# "Defendermate2".final_outreach_users_<name> view. Nothing else to change.
+
 name = "cloud-security"
 description = "CSPM, IaC scanning, container & k8s security, secret detection"
 
 # --- Cloud security posture management -------------------------------------------
-[[target]]
-repo = "prowler-cloud/prowler"
-note = "CSPM for AWS/Azure/GCP/K8s - the closest comparable audience"
-weight = 1.0
+# [[target]]
+# repo = "prowler-cloud/prowler"
+# note = "CSPM for AWS/Azure/GCP/K8s - the closest comparable audience"
+# weight = 1.0
 
-[[target]]
-repo = "aquasecurity/cloudsploit"
-note = "Cloud security scanning (Aqua)"
+# [[target]]
+# repo = "aquasecurity/cloudsploit"
+# note = "Cloud security scanning (Aqua)"
 
 # [[target]]
 # repo = "nccgroup/ScoutSuite"
@@ -48,10 +53,10 @@ note = "Cloud security scanning (Aqua)"
 # note = "Cloud asset inventory ETL"
 
 # # --- Infrastructure-as-code scanning ----------------------------------------------
-[[target]]
-repo = "bridgecrewio/checkov"
-note = "IaC static analysis - high-intent audience"
-weight = 1.0
+# [[target]]
+# repo = "bridgecrewio/checkov"
+# note = "IaC static analysis - high-intent audience"
+# weight = 1.0
 
 # [[target]]
 # repo = "aquasecurity/tfsec"
