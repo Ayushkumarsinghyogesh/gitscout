@@ -48,10 +48,10 @@ note = "Cloud security scanning (Aqua)"
 # note = "Cloud asset inventory ETL"
 
 # # --- Infrastructure-as-code scanning ----------------------------------------------
-# [[target]]
-# repo = "bridgecrewio/checkov"
-# note = "IaC static analysis - high-intent audience"
-# weight = 1.0
+[[target]]
+repo = "bridgecrewio/checkov"
+note = "IaC static analysis - high-intent audience"
+weight = 1.0
 
 # [[target]]
 # repo = "aquasecurity/tfsec"

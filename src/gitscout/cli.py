@@ -598,7 +598,8 @@ def threads_cmd(
     """
     settings = _settings(ctx)
     if role and role not in THREAD_ROLES:
-        raise typer.BadParameter(f"--role must be one of {', '.join(THREAD_ROLES)}")
+        typer.secho(f"--role must be one of {', '.join(THREAD_ROLES)}", fg=typer.colors.RED, err=True)
+        raise typer.Exit(2)
     chosen = _kinds(sections, THREAD_KINDS) if sections else THREAD_KINDS
 
     target_list = _run_sync_targets(repos or [], _kinds(None), targets)
