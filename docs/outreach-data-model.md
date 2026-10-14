@@ -55,9 +55,43 @@ total attributed to an individual.
 | `repository_stars_count` / `repository_forks_count` | **Repository-wide** totals, the same for every row of a repo. Popularity context only |
 
 The detail arrays (`issue_details`, `discussion_details`, `pull_request_details`) hold one
-object per thread, newest first, with a 500-character `excerpt` of the description. The
-full text and every comment are in `gitscout.issue_detail` and friends -- kept out of
-here so one prolific maintainer cannot produce a multi-megabyte row.
+object per thread, newest first, with a 500-character `excerpt` of the description and
+an `own_comments` **count**. The complete content lives one join away and is never
+truncated there:
+
+| Want | Read |
+|---|---|
+| The full description of a thread | `gitscout.threads_all.body` (every line, Markdown intact; NULL means GitHub has no body, never that one was dropped) |
+| Every comment, review, reply and inline code comment, with author, timestamps, URL | `gitscout.comments_all` (`comment_type` says which; `url` links to it on GitHub) |
+| One person's threads with the whole conversation attached, each commenter's email alongside | `gitscout.issue_detail` / `discussion_detail` / `pr_detail` (`comments` is a JSON array of full objects) |
+| The comments written by a thread's **opener** | `select * from gitscout.comments_all c join gitscout.threads_all t using (repo, kind, number) where c.author = t.author` |
+
+**`own_comments` semantics, precisely:** inside a detail object it is the number of
+comments *the row's person* wrote in that thread -- not the thread opener's, and not
+the repository owner's. It is a count because embedding bodies here was measured at
+24.9 MB for the busiest maintainer's single row; the full objects are in the views
+above. `comment_count` on a thread is GitHub's own total, `comments_stored` is how many
+are held, and `comments_truncated` is true only while a gap remains (a run with
+`--fill` closes it).
+
+## Where `email` comes from, and why a LinkedIn link does not give one
+
+There is no "LinkedIn email" anywhere in the pipeline, and there cannot be: LinkedIn
+publishes no address through anything GitScout touches. `email` has exactly three
+sources, all GitHub:
+
+| `email_source` | What it is | Confidence |
+|---|---|---|
+| `gql_profile` | The address the person put on their own GitHub profile | 0.95 |
+| `gql_contrib` | The author line of their commits in the target repository | 0.85 |
+| `gql_commit` | The author line of commits in their own public repositories | 0.80 |
+
+`linkedin_url` comes from the person's GitHub profile too (`socialAccounts`, or a
+LinkedIn link typed into the website field). It is a second contact channel, not a
+source of email. Measured on 2026-10-14 for trivy: 5,274 people, 3,433 with an email,
+676 with a LinkedIn link, 117 with a LinkedIn link and no email. Every NULL email was
+checked against the source tables: none is a lost value, all are addresses the person
+never published. GitScout never guesses an address.
 
 ## Contact fields, and what they do not claim
 
@@ -111,7 +145,7 @@ Bots and organisations are signals about a repository, never prospects: rows req
 
 1. `gitscout repo-info owner/name` -- registers its stable id
 2. Collect it: `gitscout scout owner/name --with-threads`
-3. `python supabase-load.py` -- pushes and refreshes the dataset
+3. `gitscout supabase push` -- creates the repo's schema on first sight, pushes, refreshes the dataset
 4. Optional per-repo view, one line:
    ```sql
    create view "Defendermate2".final_outreach_users_<name> with (security_invoker = true) as

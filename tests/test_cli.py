@@ -27,7 +27,7 @@ def test_help_lists_commands():
     assert res.exit_code == 0
     for cmd in (
         "ingest", "enrich", "export", "run", "stats", "suppress", "rate-limit",
-        "threads", "thread-tails",
+        "threads", "supabase",
     ):
         assert cmd in res.output
 

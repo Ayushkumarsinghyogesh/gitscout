@@ -16,10 +16,12 @@ Four things shape the design:
   never show it again, so the scheduled pass walks UPDATED_AT and stops at the
   high-water mark. Backfill keeps CREATED_AT because it is stable under a cursor --
   rows cannot reorder mid-crawl and make a resumed page skip items.
-* **Threads are capped, and the cap is recorded.** Paging a 400-comment thread costs
-  20 queries for context nobody reads. We take the first `comments` of each thread,
-  flag it `comments_truncated`, and `--tails` then fetches the newest slice of exactly
-  those threads -- where the live state of the conversation actually is.
+* **Threads are capped, and the cap is recorded.** The page query takes the first
+  `comments` of each thread and flags anything longer as `comments_truncated`;
+  `fill_capped_threads` then pages exactly those threads start to finish, so nothing
+  is ever silently discarded -- megathreads just cost their own queries, on purpose,
+  instead of inflating every page. Replies, reviews and inline code comments are
+  completed inline during the harvest: they are small, and a cap there had no flag.
 * **Reviews and replies are comments too.** A PR reviewer who never left an ordinary
   comment is still involved, and the person whose discussion reply was accepted as the
   answer is the most involved person in the thread. Both land in `thread_comments`
@@ -52,13 +54,16 @@ from .ingest_gql import (
 )
 from .models import THREAD_KINDS, Interaction, Profile, ThreadComment, ThreadRecord
 from .queries import (
+    DISCUSSION_REPLIES_FILL,
+    PR_REVIEWS_FILL,
+    PR_REVIEW_THREADS,
     REPO_INFO,
     THREAD_ORDER_CREATED,
     THREAD_ORDER_UPDATED,
     alias_for,
+    fill_query,
     profiles_query,
     social_query,
-    tail_query,
     thread_query,
 )
 from .storage import Store
@@ -86,7 +91,6 @@ class ThreadHarvestResult:
     fetched: int = 0
     new: int = 0
     comments_new: int = 0
-    tails: int = 0
     points: int = 0
     pages: int = 0
     complete: bool = False
@@ -170,6 +174,8 @@ def _comment(
         upvotes=raw.get("upvoteCount"),
         review_state=raw.get("state") if comment_type == "review" else None,
         parent_id=parent_id,
+        url=raw.get("url"),
+        file_path=raw.get("path"),
     )
 
 
@@ -210,6 +216,22 @@ def thread_from_node(
             comments.append(
                 _comment(repo, kind, number, raw, comment_type="review", position=position)
             )
+
+    # Inline code-review comments. The review they belong to becomes `parent_id`, the
+    # file they sit on `file_path` -- both straight from the node, nothing inferred.
+    position = 0
+    for thread_node in ((node.get("reviewThreads") or {}).get("nodes") or []):
+        for raw in ((thread_node or {}).get("comments") or {}).get("nodes") or []:
+            if raw and raw.get("id"):
+                comments.append(
+                    _comment(
+                        repo, kind, number, raw,
+                        comment_type="review_comment",
+                        position=position,
+                        parent_id=((raw.get("pullRequestReview") or {}).get("id")),
+                    )
+                )
+                position += 1
 
     stored_comments = sum(1 for c in comments if c.comment_type == "comment")
     total_comments = _total(thread)
@@ -302,7 +324,6 @@ async def harvest_threads(
     page_size: int = DEFAULT_PAGE_SIZE,
     incremental: bool = False,
     fresh: bool = False,
-    tails: int = 0,
     unchanged_streak: int = UNCHANGED_STREAK,
 ) -> ThreadHarvestResult:
     """Collect full records for one (repo, kind).
@@ -390,6 +411,16 @@ async def harvest_threads(
         result.comments_new += store.add_thread_comments(
             [c for _, thread in batch for c in thread]
         )
+        # Inner connections (replies, reviews, review threads) are completed here and
+        # now; only the main comment thread is allowed to stay capped, with its flag.
+        kept_numbers = {record.number for record, _ in batch}
+        for node in page.nodes:
+            if node.get("number") in kept_numbers:
+                extra_points, extra_comments = await _complete_node_overflow(
+                    client, store, repo, kind, node
+                )
+                result.points += extra_points
+                result.comments_new += extra_comments
 
         if not incremental:
             store.set_crawl_state(
@@ -412,77 +443,9 @@ async def harvest_threads(
     if newest_updated:
         store.set_crawl_state(water_key, high_water=newest_updated)
 
-    if tails:
-        done, tail_points = await fetch_comment_tails(
-            client, store, repo, kind, limit=tails, comments=comments
-        )
-        result.tails = done
-        result.points += tail_points
-
     if not result.pages:
         log.warning("%s: nothing returned (repo not found, or this section is empty)", cursor_key)
     return result
-
-
-async def fetch_comment_tails(
-    client: GraphQLClient,
-    store: Store,
-    repo: str | None = None,
-    kind: str | None = None,
-    *,
-    limit: int = 50,
-    comments: int = DEFAULT_COMMENTS,
-) -> tuple[int, int]:
-    """Fetch the newest comments of capped threads. Returns (threads, points).
-
-    One query per thread, so it is bounded by ``limit`` and opt-in. The tail is stored
-    at its real position in the thread, which leaves a gap in ``position`` where the
-    unfetched middle is -- the gap is the point, not a bug.
-    """
-    pending = store.threads_needing_tail(repo, kind, limit=limit)
-    if not pending:
-        return 0, 0
-
-    done = 0
-    points = 0
-    for row in pending:
-        row_kind = row["kind"]
-        query, path = tail_query(row_kind)
-        owner, name = row["repo"].split("/", 1)
-        result = await client.execute(
-            query,
-            {
-                "owner": owner,
-                "name": name,
-                "number": int(row["number"]),
-                "last": max(1, comments),
-            },
-        )
-        points += result.cost
-        thread_node = result.pluck(*path)
-        if not isinstance(thread_node, Mapping):
-            continue
-        thread = thread_node.get("comments") or {}
-        nodes = [n for n in (thread.get("nodes") or []) if n and n.get("id")]
-        total = thread.get("totalCount") or row["comment_count"] or len(nodes)
-        offset = max(0, int(total) - len(nodes))
-
-        store.add_thread_comments(
-            [
-                _comment(
-                    row["repo"], row_kind, int(row["number"]), raw,
-                    comment_type="comment", position=offset + index,
-                )
-                for index, raw in enumerate(nodes)
-            ]
-        )
-        stored = store.comments_stored(row["repo"], row_kind, int(row["number"]))
-        store.mark_comments_stored(
-            row["repo"], row_kind, int(row["number"]),
-            stored=stored, truncated=stored < int(total),
-        )
-        done += 1
-    return done, points
 
 
 @dataclass
@@ -501,10 +464,6 @@ class ThreadTotals:
     def points(self) -> int:
         return sum(r.points for r in self.results)
 
-    @property
-    def tails(self) -> int:
-        return sum(r.tails for r in self.results)
-
 
 async def harvest_repos(
     client: GraphQLClient,
@@ -517,7 +476,6 @@ async def harvest_repos(
     page_size: int = DEFAULT_PAGE_SIZE,
     incremental: bool = False,
     fresh: bool = False,
-    tails: int = 0,
 ) -> ThreadTotals:
     """Harvest each (repo, kind) in turn. Sequential: points are one shared budget."""
     totals = ThreadTotals()
@@ -531,7 +489,6 @@ async def harvest_repos(
                     page_size=page_size,
                     incremental=incremental,
                     fresh=fresh,
-                    tails=tails,
                 )
             )
     return totals
@@ -688,3 +645,170 @@ async def resolve_social(
             min(start + PROFILE_BATCH, len(logins)), len(logins), found,
         )
     return len(logins), found
+
+
+# -------------------------------------------------- completing capped content
+
+async def _drain(
+    client: GraphQLClient,
+    query: str,
+    variables: dict[str, Any],
+    path: tuple[str, ...],
+    *,
+    after: str | None,
+    page_size: int = 50,
+) -> tuple[list[dict[str, Any]], int]:
+    """Walk one connection from `after` to its end. Returns (nodes, points)."""
+    nodes: list[dict[str, Any]] = []
+    points = 0
+    cursor = after
+    while True:
+        result = await client.execute(
+            query, {**variables, "first": page_size, "after": cursor}
+        )
+        points += result.cost
+        connection = result.pluck(*path)
+        if not isinstance(connection, Mapping):
+            break
+        nodes.extend(n for n in (connection.get("nodes") or []) if n)
+        info = connection.get("pageInfo") or {}
+        cursor = info.get("endCursor")
+        if not info.get("hasNextPage") or not cursor:
+            break
+    return nodes, points
+
+
+async def _complete_node_overflow(
+    client: GraphQLClient, store: Store, repo: str, kind: str, node: Mapping[str, Any]
+) -> tuple[int, int]:
+    """Fetch what a page node's inner connections could not carry.
+
+    Replies, reviews and review-thread comments are completed here, inline during the
+    harvest, because they are small and the alternative is bookkeeping a truncation
+    flag per inner connection. The main comment thread is NOT completed here -- that
+    stays behind `comments_truncated` + `fill_capped_threads`, which is the deliberate
+    cost control for 700-comment megathreads.
+    """
+    owner, name = repo.split("/", 1)
+    number = int(node["number"])
+    points = 0
+    rows: list[ThreadComment] = []
+
+    # discussion replies past the per-comment page
+    for raw in ((node.get("thread") or {}).get("nodes") or []):
+        replies = (raw or {}).get("replies") or {}
+        info = replies.get("pageInfo") or {}
+        if info.get("hasNextPage") and raw.get("id"):
+            extra, cost = await _drain(
+                client, DISCUSSION_REPLIES_FILL, {"id": raw["id"]},
+                ("node", "replies"), after=info.get("endCursor"),
+            )
+            points += cost
+            offset = len(replies.get("nodes") or [])
+            rows.extend(
+                _comment(repo, kind, number, reply, comment_type="reply",
+                         position=offset + index, parent_id=raw["id"])
+                for index, reply in enumerate(extra) if reply.get("id")
+            )
+
+    # PR reviews past the page
+    reviews = node.get("reviews") or {}
+    info = reviews.get("pageInfo") or {}
+    if info.get("hasNextPage"):
+        extra, cost = await _drain(
+            client, PR_REVIEWS_FILL, {"owner": owner, "name": name, "number": number},
+            ("repository", "pullRequest", "reviews"), after=info.get("endCursor"),
+        )
+        points += cost
+        offset = len(reviews.get("nodes") or [])
+        rows.extend(
+            _comment(repo, kind, number, raw, comment_type="review", position=offset + index)
+            for index, raw in enumerate(extra) if raw.get("id")
+        )
+
+    # review threads past the page (or inner comment pages)
+    threads_conn = node.get("reviewThreads") or {}
+    inner_overflow = any(
+        (((t or {}).get("comments") or {}).get("pageInfo") or {}).get("hasNextPage")
+        for t in (threads_conn.get("nodes") or [])
+    )
+    if (threads_conn.get("pageInfo") or {}).get("hasNextPage") or inner_overflow:
+        threads, cost = await _drain(
+            client, PR_REVIEW_THREADS, {"owner": owner, "name": name, "number": number},
+            ("repository", "pullRequest", "reviewThreads"), after=None, page_size=25,
+        )
+        points += cost
+        position = 0
+        for thread_node in threads:
+            for raw in (((thread_node or {}).get("comments") or {}).get("nodes") or []):
+                if raw and raw.get("id"):
+                    rows.append(
+                        _comment(repo, kind, number, raw, comment_type="review_comment",
+                                 position=position,
+                                 parent_id=(raw.get("pullRequestReview") or {}).get("id"))
+                    )
+                    position += 1
+
+    added = store.add_thread_comments(rows) if rows else 0
+    return points, added
+
+
+async def fill_capped_threads(
+    client: GraphQLClient,
+    store: Store,
+    repo: str | None = None,
+    kind: str | None = None,
+    *,
+    limit: int = 0,
+    page_size: int = 100,
+) -> tuple[int, int, int]:
+    """Complete every thread flagged `comments_truncated`, start to finish.
+
+    Replaces the old newest-slice "tail" approach, which deliberately left the middle
+    of long threads unfetched. This walks the whole comments connection; the writes
+    are idempotent, so the overlap with what is already stored costs nothing. Returns
+    (threads completed, comments added, points).
+    """
+    pending = store.threads_needing_tail(repo, kind, limit=limit)
+    done = added = points = 0
+    for row in pending:
+        row_kind = row["kind"]
+        owner, name = row["repo"].split("/", 1)
+        query, path = fill_query(row_kind)
+        nodes, cost = await _drain(
+            client, query, {"owner": owner, "name": name, "number": int(row["number"])},
+            path, after=None, page_size=page_size,
+        )
+        points += cost
+        rows: list[ThreadComment] = []
+        for position, raw in enumerate(nodes):
+            if not raw.get("id"):
+                continue
+            rows.append(
+                _comment(row["repo"], row_kind, int(row["number"]), raw,
+                         comment_type="comment", position=position)
+            )
+            replies = raw.get("replies") or {}
+            reply_nodes = [r for r in (replies.get("nodes") or []) if r and r.get("id")]
+            if (replies.get("pageInfo") or {}).get("hasNextPage"):
+                extra, cost = await _drain(
+                    client, DISCUSSION_REPLIES_FILL, {"id": raw["id"]},
+                    ("node", "replies"), after=(replies.get("pageInfo") or {}).get("endCursor"),
+                )
+                points += cost
+                reply_nodes.extend(r for r in extra if r.get("id"))
+            rows.extend(
+                _comment(row["repo"], row_kind, int(row["number"]), reply,
+                         comment_type="reply", position=reply_index, parent_id=raw["id"])
+                for reply_index, reply in enumerate(reply_nodes)
+            )
+        added += store.add_thread_comments(rows)
+        stored = store.comments_stored(row["repo"], row_kind, int(row["number"]))
+        store.mark_comments_stored(
+            row["repo"], row_kind, int(row["number"]),
+            stored=stored, truncated=stored < len(nodes),
+        )
+        done += 1
+        log.info("fill %s/%s/#%s: %d comments, total points %d",
+                 row["repo"], row_kind, row["number"], len(nodes), points)
+    return done, added, points

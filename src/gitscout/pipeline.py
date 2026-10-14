@@ -23,6 +23,7 @@ from .threads_gql import (
     DEFAULT_COMMENTS,
     DEFAULT_PAGE_SIZE,
     ThreadTotals,
+    fill_capped_threads,
     harvest_repos,
     resolve_participants,
 )
@@ -149,6 +150,9 @@ class ScoutResult:
     threads: ThreadTotals = field(default_factory=ThreadTotals)
     participants_resolved: int = 0
     participant_emails: int = 0
+    threads_filled: int = 0
+    thread_fill_comments: int = 0
+    thread_fill_points: int = 0
     enrich: EnrichGqlSummary = field(default_factory=EnrichGqlSummary)
     provider_hits: int = 0
     provider_calls: int = 0
@@ -161,7 +165,10 @@ class ScoutResult:
 
     @property
     def points(self) -> int:
-        return self.ingest.points + self.enrich.points + self.threads.points
+        return (
+            self.ingest.points + self.enrich.points + self.threads.points
+            + self.thread_fill_points
+        )
 
     @property
     def emails_new(self) -> int:
@@ -231,7 +238,7 @@ async def run_scout(
     thread_kinds: Sequence[str] = THREAD_KINDS,
     thread_comments: int = DEFAULT_COMMENTS,
     thread_page_size: int = DEFAULT_PAGE_SIZE,
-    thread_tails: int = 0,
+    thread_fill: bool = True,
     transport: httpx.AsyncBaseTransport | None = None,
     http: httpx.AsyncClient | None = None,
     host_check: HostCheck = is_public_host,
@@ -311,8 +318,16 @@ async def run_scout(
                         page_size=thread_page_size,
                         incremental=incremental,
                         fresh=fresh,
-                        tails=thread_tails,
                     )
+                    if thread_fill:
+                        # Complete every thread the page cap flagged, so a scheduled
+                        # run never leaves a conversation half-stored.
+                        filled, extra, fill_points = await fill_capped_threads(
+                            client, store
+                        )
+                        result.threads_filled = filled
+                        result.thread_fill_comments = extra
+                        result.thread_fill_points = fill_points
                     # Before enrichment, not after: someone whose only trace is a
                     # comment has no profile, so the email stages would skip them
                     # entirely. Looking them up here puts them in the same queue as

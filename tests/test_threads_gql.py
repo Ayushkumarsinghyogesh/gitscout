@@ -12,6 +12,7 @@ import json
 import pytest
 from gqlhelpers import (
     comment,
+    connection,
     discussion_node,
     gql_bot,
     gql_user,
@@ -37,7 +38,7 @@ from gitscout.models import (
     ThreadComment,
     ThreadRecord,
 )
-from gitscout.threads_gql import fetch_comment_tails, harvest_threads, thread_from_node
+from gitscout.threads_gql import fill_capped_threads, harvest_threads, thread_from_node
 
 CONNECTION = {"issues": "issues", "prs": "pullRequests", "discussions": "discussions"}
 OPERATION = {"issues": "IssueDetails", "prs": "PullRequestDetails", "discussions": "DiscussionDetails"}
@@ -330,66 +331,66 @@ def test_each_section_keeps_its_own_crawl_state(gql, make_gql_client, store):
     assert store.get_crawl_state("threads:o/r:prs") is None
 
 
-# --------------------------------------------------------------- capped tails
+# ------------------------------------------------------------- filling capped threads
 
 
-@pytest.mark.parametrize(
-    "kind,field,op",
-    [
-        ("issues", "issue", "IssueCommentsTail"),
-        ("prs", "pullRequest", "PullRequestCommentsTail"),
-        ("discussions", "discussion", "DiscussionCommentsTail"),
-    ],
-)
-def test_the_tail_pass_stores_the_newest_comments_at_their_real_position(
-    gql, make_gql_client, store, kind, field, op
-):
-    node = {
-        "issues": issue_node, "prs": pr_node, "discussions": discussion_node
-    }[kind](1, gql_user("alice"), comments=[comment("c1", gql_user("bob"))], comments_total=5)
-    gql.add(OPERATION[kind], thread_body(CONNECTION[kind], [node]))
-    result = _harvest(gql, make_gql_client, store, kind)
+def test_fill_pages_a_capped_thread_start_to_finish(gql, make_gql_client, store):
+    """The old "tails" approach fetched only the newest slice, leaving a hole in the
+    middle. Fill walks the whole connection and clears the flag."""
+    node = issue_node(1, gql_user("alice"), comments=[comment("c1", gql_user("bob"))],
+                      comments_total=5)
+    gql.add(OPERATION["issues"], thread_body(CONNECTION["issues"], [node]))
+    result = _harvest(gql, make_gql_client, store, "issues")
     assert result.truncated == 1
 
-    gql.add(
-        op,
-        tail_body(
-            field, 1,
-            [comment("c4", gql_user("carol"), body="still broken"),
-             comment("c5", gql_user("alice"), body="any update?")],
-            total=5,
-        ),
+    gql.add_pages(
+        "Fill",
+        [
+            {"repository": {"issue": {"number": 1, "comments": connection(
+                nodes=[comment(f"c{i}", gql_user("bob")) for i in (1, 2, 3)],
+                total=5, has_next=True, cursor="C1")}}},
+            {"repository": {"issue": {"number": 1, "comments": connection(
+                nodes=[comment("c4", gql_user("carol")), comment("c5", gql_user("alice"))],
+                total=5)}}},
+        ],
     )
 
     async def go():
         async with make_gql_client(gql) as client:
-            return await fetch_comment_tails(client, store, "o/r", kind, limit=10, comments=2)
+            return await fill_capped_threads(client, store, "o/r", "issues")
 
-    done, _points = run(go())
+    done, added, _points = run(go())
 
-    assert done == 1
-    rows = store.thread_comment_rows(kinds=[kind])
-    # head at 0, tail at 3 and 4: the gap is the unfetched middle, on purpose
-    assert [(r["comment_id"], r["position"]) for r in rows] == [("c1", 0), ("c4", 3), ("c5", 4)]
-    assert [r["number"] for r in store.threads_needing_tail()] == [1]
+    assert done == 1 and added == 4  # c1 already stored; idempotent overlap is free
+    rows = store.thread_comment_rows(kinds=["issues"])
+    assert [(r["comment_id"], r["position"]) for r in rows] == [
+        ("c1", 0), ("c2", 1), ("c3", 2), ("c4", 3), ("c5", 4)
+    ]
+    assert store.threads_needing_tail() == []  # flag cleared: nothing missing
+    # the follow-up page resumed from the cursor
+    assert gql.variables_for("Fill")[-1]["after"] == "C1"
 
 
-def test_a_fully_recovered_thread_stops_being_flagged(gql, make_gql_client, store):
-    gql.add(
-        "IssueDetails",
-        thread_body("issues", [issue_node(1, gql_user("alice"),
-                                          comments=[comment("c1", gql_user("bob"))],
-                                          comments_total=2)]),
-    )
-    _harvest(gql, make_gql_client, store)
-    gql.add("IssueCommentsTail", tail_body("issue", 1, [comment("c2", gql_user("carol"))], total=2))
+def test_fill_also_collects_replies_inside_the_pages(gql, make_gql_client, store):
+    node = discussion_node(2, gql_user("alice"), comments=[comment("d1", gql_user("bob"))],
+                           comments_total=2)
+    gql.add(OPERATION["discussions"], thread_body(CONNECTION["discussions"], [node]))
+    _harvest(gql, make_gql_client, store, "discussions")
+
+    gql.add("Fill", {"repository": {"discussion": {"number": 2, "comments": connection(
+        nodes=[comment("d1", gql_user("bob")),
+               comment("d2", gql_user("carol"),
+                       replies=[comment("d2r1", gql_user("alice"), body="thanks!")])],
+        total=2)}}})
 
     async def go():
         async with make_gql_client(gql) as client:
-            return await fetch_comment_tails(client, store, "o/r", "issues", limit=10, comments=1)
+            return await fill_capped_threads(client, store, "o/r", "discussions")
 
     run(go())
-    assert store.threads_needing_tail() == []
+    rows = store.thread_comment_rows(kinds=["discussions"])
+    kinds = {(r["comment_id"], r["comment_type"]) for r in rows}
+    assert ("d2r1", "reply") in kinds and ("d2", "comment") in kinds
 
 
 # ------------------------------------------------------------------ involvement
@@ -669,3 +670,73 @@ def test_social_lookup_takes_only_what_the_person_published(gql, make_gql_client
     assert all(r["social_fetched_at"] for r in rows.values())
     # a second run skips people already looked up
     assert store.logins_needing_social() == []
+
+
+# -------------------------------------------- full content: urls, code comments
+
+from gqlhelpers import review_comment  # noqa: E402
+
+
+def test_every_comment_carries_its_github_url():
+    _record, comments = thread_from_node(
+        "o/r", "issues", issue_node(1, gql_user("a"), comments=[comment("c1", gql_user("b"))])
+    )
+    assert comments[0].url == "https://github.com/o/r/comments/c1"
+
+
+def test_inline_code_review_comments_are_collected_with_file_and_review():
+    node = pr_node(
+        9, gql_user("alice"),
+        reviews=[review("r1", gql_user("m"), state="CHANGES_REQUESTED")],
+        review_thread_comments=[
+            review_comment("rc1", gql_user("m"), review_id="r1", path="pkg/db.go"),
+            review_comment("rc2", gql_user("alice"), review_id="r1", path="pkg/db.go",
+                           body="done, renamed"),
+        ],
+    )
+    _record, comments = thread_from_node("o/r", "prs", node)
+    inline = [c for c in comments if c.comment_type == "review_comment"]
+
+    assert [(c.comment_id, c.parent_id, c.file_path) for c in inline] == [
+        ("rc1", "r1", "pkg/db.go"), ("rc2", "r1", "pkg/db.go"),
+    ]
+    assert inline[0].url.endswith("#discussion_rc1")
+    # inline comments never count against the thread-comments cap
+    assert _record.comments_stored == 0
+
+
+def test_review_overflow_is_completed_inline_during_harvest(gql, make_gql_client, store):
+    """76 PRs sat at the 20-review cap with no flag. Now the harvest notices
+    `hasNextPage` and drains the rest before moving on."""
+    node = pr_node(4, gql_user("alice"),
+                   reviews=[review("r1", gql_user("m"))],
+                   reviews_has_next=True, reviews_cursor="RC1")
+    gql.add(OPERATION["prs"], thread_body(CONNECTION["prs"], [node]))
+    gql.add("ReviewsFill", {"repository": {"pullRequest": {"number": 4, "reviews": connection(
+        nodes=[review("r2", gql_user("carol"), state="APPROVED")], total=2)}}})
+
+    result = _harvest(gql, make_gql_client, store, "prs")
+
+    assert gql.variables_for("ReviewsFill")[0]["after"] == "RC1"
+    rows = {r["comment_id"]: r for r in store.thread_comment_rows(kinds=["prs"])}
+    assert {"r1", "r2"} <= set(rows)
+    assert rows["r2"]["review_state"] == "APPROVED"
+    assert result.comments_new == 2
+
+
+def test_reply_overflow_is_completed_inline_during_harvest(gql, make_gql_client, store):
+    """313 discussion comments sat at the old 5-reply cap with no flag."""
+    parent = comment("d1", gql_user("bob"),
+                     replies=[comment("d1r1", gql_user("alice"))])
+    parent["replies"]["pageInfo"] = {"hasNextPage": True, "endCursor": "RP1"}
+    node = discussion_node(7, gql_user("alice"), comments=[parent])
+    gql.add(OPERATION["discussions"], thread_body(CONNECTION["discussions"], [node]))
+    gql.add("RepliesFill", {"node": {"id": "d1", "replies": connection(
+        nodes=[comment("d1r2", gql_user("carol"), body="late reply")], total=2)}})
+
+    result = _harvest(gql, make_gql_client, store, "discussions")
+
+    assert gql.variables_for("RepliesFill")[0] == {"id": "d1", "first": 50, "after": "RP1"}
+    rows = {r["comment_id"]: r for r in store.thread_comment_rows(kinds=["discussions"])}
+    assert rows["d1r2"]["comment_type"] == "reply" and rows["d1r2"]["body"] == "late reply"
+    assert result.comments_new == 3  # d1 + both replies

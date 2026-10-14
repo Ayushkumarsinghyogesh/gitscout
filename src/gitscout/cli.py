@@ -20,8 +20,8 @@ from .threads_gql import (
     DEFAULT_COMMENTS,
     DEFAULT_PAGE_SIZE,
     ThreadTotals,
-    fetch_comment_tails,
     fetch_repo_info,
+    fill_capped_threads,
     harvest_repos,
     resolve_participants,
     resolve_social,
@@ -89,7 +89,6 @@ TargetsOpt = Annotated[Optional[str], typer.Option("--targets", "-t", help="Targ
 OutOpt = Annotated[Optional[list[Path]], typer.Option("--out", "-o", help="Output file (repeatable; .csv or .jsonl)")]
 CommentsOpt = Annotated[int, typer.Option("--comments", help=f"Comments stored per thread before it is marked truncated (default {DEFAULT_COMMENTS})")]
 SectionsOpt = Annotated[Optional[str], typer.Option("--sections", help=f"Comma list of: {', '.join(THREAD_KINDS)}. Default: all three")]
-TailsOpt = Annotated[int, typer.Option("--tails", help="Also fetch the NEWEST comments of up to N capped threads (1 query each)")]
 
 
 def _settings(ctx: typer.Context) -> Settings:
@@ -165,10 +164,7 @@ def _report_threads(totals: ThreadTotals) -> None:
             + (f"  ({r.truncated} capped)" if r.truncated else "")
         )
     if totals.results:
-        typer.echo(
-            f"cost:   {totals.points} GraphQL points"
-            + (f", {totals.tails} tail(s) fetched" if totals.tails else "")
-        )
+        typer.echo(f"cost:   {totals.points} GraphQL points")
 
 
 def _report_scout(result: ScoutResult) -> None:
@@ -183,6 +179,11 @@ def _report_scout(result: ScoutResult) -> None:
         typer.echo(
             f"participants: {result.participants_resolved} comment-only people looked up, "
             f"+{result.participant_emails} emails"
+        )
+    if result.threads_filled:
+        typer.echo(
+            f"filled: {result.threads_filled} capped thread(s) completed, "
+            f"+{result.thread_fill_comments} comments"
         )
     e = result.enrich
     typer.echo(
@@ -247,7 +248,6 @@ def scout(
     with_threads: Annotated[bool, typer.Option("--with-threads", help="Also collect full issue/PR/discussion records + comment threads (costs more; see `gitscout threads`)")] = False,
     sections: SectionsOpt = None,
     thread_comments: CommentsOpt = DEFAULT_COMMENTS,
-    thread_tails: TailsOpt = 0,
     with_social: Annotated[bool, typer.Option("--with-social", help="Also fetch the LinkedIn link and public repo count people publish (~1 point / 25 people)")] = False,
     push: Annotated[bool, typer.Option("--push", help="Then register the repos, push to Supabase and refresh the outreach dataset. Holds a run lock.")] = False,
 ) -> None:
@@ -278,7 +278,7 @@ def scout(
                 no_providers=no_providers, out=out, new_only=new_only,
                 only_with_email=only_with_email, min_confidence=min_confidence,
                 with_threads=with_threads, sections=sections,
-                thread_comments=thread_comments, thread_tails=thread_tails,
+                thread_comments=thread_comments,
                 with_social=with_social, push=push,
             )
     except RunLocked as exc:
@@ -292,7 +292,7 @@ def _scout_once(
     *,
     max_items, fresh, incremental, no_enrich, limit, scan_websites, no_providers,
     out, new_only, only_with_email, min_confidence, with_threads, sections,
-    thread_comments, thread_tails, with_social, push,
+    thread_comments, with_social, push,
 ) -> None:
     result = _run(
         run_scout(
@@ -312,7 +312,6 @@ def _scout_once(
             with_threads=with_threads,
             thread_kinds=_kinds(sections, THREAD_KINDS) if sections else THREAD_KINDS,
             thread_comments=thread_comments,
-            thread_tails=thread_tails,
             progress=_progress,
         )
     )
@@ -647,7 +646,7 @@ def threads_cmd(
     sections: SectionsOpt = None,
     max_items: MaxOpt = 0,
     comments: CommentsOpt = DEFAULT_COMMENTS,
-    tails: TailsOpt = 0,
+    fill: Annotated[bool, typer.Option("--fill/--no-fill", help="Afterwards, page every thread longer than --comments to the very end (complete content; megathreads cost extra queries)")] = True,
     page_size: Annotated[int, typer.Option("--page-size", help=f"Threads per query (default {DEFAULT_PAGE_SIZE}; each one drags a body and a thread behind it)")] = DEFAULT_PAGE_SIZE,
     incremental: Annotated[bool, typer.Option("--incremental", help="Only threads updated since the last run (UPDATED_AT order, so old threads with new comments are included)")] = False,
     fresh: FreshOpt = False,
@@ -687,7 +686,7 @@ def threads_cmd(
                 async with GraphQLClient(
                     settings.tokens, user_agent=settings.user_agent
                 ) as client:
-                    return await harvest_repos(
+                    totals = await harvest_repos(
                         client,
                         store,
                         repo_list,
@@ -697,11 +696,19 @@ def threads_cmd(
                         page_size=page_size,
                         incremental=incremental,
                         fresh=fresh,
-                        tails=tails,
                     )
+                    filled = (0, 0, 0)
+                    if fill:
+                        filled = await fill_capped_threads(client, store)
+                    return totals, filled
 
-        totals = _run(go())
+        totals, (filled_threads, filled_comments, fill_points) = _run(go())
         _report_threads(totals)
+        if filled_threads:
+            typer.echo(
+                f"filled: {filled_threads} capped thread(s) completed, "
+                f"+{filled_comments} comments, {fill_points} points"
+            )
 
     with Store(settings.db_path) as store:
         s = store.thread_stats()
@@ -714,7 +721,7 @@ def threads_cmd(
         if s["threads_truncated"]:
             typer.echo(
                 f"        {s['threads_truncated']} thread(s) longer than --comments; "
-                f"run `gitscout thread-tails` to pull their newest comments"
+                f"run `gitscout threads --export-only` after a run with --fill"
             )
         try:
             if out:
@@ -807,43 +814,6 @@ def social_cmd(
 
     looked, found, points = _run(go())
     typer.echo(f"looked up {looked} people, {found} LinkedIn links, {points} GraphQL points")
-
-
-@app.command("thread-tails")
-def thread_tails_cmd(
-    ctx: typer.Context,
-    repo: Annotated[Optional[str], typer.Option("--repo", help="Only this repo")] = None,
-    section: Annotated[Optional[str], typer.Option("--section", help=f"Only one of: {', '.join(THREAD_KINDS)}")] = None,
-    limit: Annotated[int, typer.Option("--limit", help="Max threads to top up (1 query each)")] = 50,
-    comments: CommentsOpt = DEFAULT_COMMENTS,
-) -> None:
-    """Fetch the newest comments of threads that were capped by --comments."""
-    settings = _settings(ctx)
-    _require_token(settings)
-    if section and section not in THREAD_KINDS:
-        raise typer.BadParameter(f"--section must be one of {', '.join(THREAD_KINDS)}")
-    from .ingest import parse_repo
-
-    target = parse_repo(repo) if repo else None
-
-    async def go():
-        with Store(settings.db_path) as store:
-            pending = store.threads_needing_tail(target, section, limit=limit)
-            if not pending:
-                return 0, 0, 0
-            async with GraphQLClient(
-                settings.tokens, user_agent=settings.user_agent
-            ) as client:
-                done, points = await fetch_comment_tails(
-                    client, store, target, section, limit=limit, comments=comments
-                )
-            return done, points, len(pending)
-
-    done, points, pending = _run(go())
-    if not pending:
-        typer.echo("No capped threads waiting.")
-        return
-    typer.echo(f"Topped up {done} of {pending} capped thread(s) for {points} GraphQL points.")
 
 
 supabase_app = typer.Typer(
@@ -1128,7 +1098,7 @@ def stats(ctx: typer.Context) -> None:
         )
         typer.echo(f"people in threads: {t['people']}  {t['by_role']}")
         if t["threads_truncated"]:
-            typer.echo(f"  threads capped:  {t['threads_truncated']} (see `gitscout thread-tails`)")
+            typer.echo(f"  threads capped:  {t['threads_truncated']} (a run with --fill completes them)")
     typer.echo(f"suppressed:        {s['suppressed']}")
     typer.echo(f"runs recorded:     {s['runs']}")
 

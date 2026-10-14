@@ -251,6 +251,8 @@ MIGRATIONS: tuple[tuple[str, str, str], ...] = (
     ("threads", "category_emoji", "TEXT"),
     ("threads", "is_answerable", "INTEGER"),
     ("threads", "closed", "INTEGER"),
+    ("thread_comments", "url", "TEXT"),
+    ("thread_comments", "file_path", "TEXT"),
     ("users", "linkedin_url", "TEXT"),
     ("users", "public_repos", "INTEGER"),
     ("users", "social_fetched_at", "TEXT"),
@@ -981,6 +983,8 @@ class Store:
                 "upvotes": c.upvotes,
                 "review_state": c.review_state,
                 "parent_id": c.parent_id,
+                "url": c.url,
+                "file_path": c.file_path,
             }
             for c in rows
         ]
@@ -993,11 +997,11 @@ class Store:
                 "INSERT OR IGNORE INTO thread_comments "
                 "(repo, kind, number, comment_id, comment_type, author, author_type, "
                 " author_association, body, created_at, updated_at, position, is_answer, "
-                " upvotes, review_state, parent_id, added_at, changed_at) "
+                " upvotes, review_state, parent_id, url, file_path, added_at, changed_at) "
                 "VALUES (:repo, :kind, :number, :comment_id, :comment_type, :author, "
                 ":author_type, :author_association, :body, :created_at, :updated_at, "
-                ":position, :is_answer, :upvotes, :review_state, :parent_id, :stamp, "
-                ":stamp)",
+                ":position, :is_answer, :upvotes, :review_state, :parent_id, :url, "
+                ":file_path, :stamp, :stamp)",
                 payload,
             )
             new = self._conn.total_changes - before
@@ -1005,6 +1009,7 @@ class Store:
                 "UPDATE thread_comments SET body = :body, updated_at = :updated_at, "
                 "author_association = :author_association, position = :position, "
                 "is_answer = :is_answer, upvotes = :upvotes, review_state = :review_state, "
+                "url = COALESCE(:url, url), file_path = COALESCE(:file_path, file_path), "
                 "changed_at = :stamp "
                 "WHERE repo = :repo AND kind = :kind AND number = :number "
                 "AND comment_id = :comment_id",

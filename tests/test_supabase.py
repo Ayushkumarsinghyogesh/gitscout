@@ -454,6 +454,8 @@ class FakeWriter:
             if FakeWriter.fail_on == "refresh":
                 raise SupabaseError("simulated refresh failure")
             return 4231
+        if "ensure_repo_schema" in sql:
+            return "defendermate_" + params[0].split("/")[1] + "_gitscout"
         return "final_outreach_users_" + params[0].split("/")[1]
 
 
@@ -483,15 +485,21 @@ def test_a_full_postgres_push_lands_everything_then_refreshes(seeded, pg):
 
     upserts = [e for e in FakeWriter.log if e[0] == "upsert"]
     tables = [e[1] for e in upserts]
-    # schema-qualified, registry first, parents before children, audit row last
+    # shared tables in gitscout, repository-scoped ones in the repo's own schema;
+    # registry first, parents before children, audit row last
     assert tables[0] == "gitscout.repositories" and tables[-1] == "gitscout.sync_runs"
     assert tables.index("gitscout.people") < tables.index("gitscout.person_emails")
-    assert tables.index("gitscout.threads") < tables.index("gitscout.comments")
-    # data commits BEFORE any view or refresh call
-    first_call = next(i for i, e in enumerate(FakeWriter.log) if e[0] == "call")
-    assert ("commit",) in FakeWriter.log[:first_call]
+    assert "defendermate_r_gitscout.threads" in tables
+    assert tables.index("defendermate_r_gitscout.threads") < tables.index("defendermate_r_gitscout.comments")
+    assert "defendermate_r_gitscout.interactions" in tables
+    assert not any(t.startswith("gitscout.threads") or t.startswith("gitscout.comments") for t in tables)
+    # the repo schema is ensured inside the data transaction, before its rows
     calls = [e[1] for e in FakeWriter.log if e[0] == "call"]
-    assert calls == ["select gitscout.ensure_outreach_view(%s)", "select gitscout.refresh_outreach()"]
+    assert calls[0] == "select gitscout.ensure_repo_schema(%s)"
+    first_commit = FakeWriter.log.index(("commit",))
+    assert FakeWriter.log.index(("call", "select gitscout.ensure_repo_schema(%s)", ("o/r",))) < first_commit
+    # data commits BEFORE any view or refresh call
+    assert calls[1:] == ["select gitscout.ensure_outreach_view(%s)", "select gitscout.refresh_outreach()"]
     assert result.refreshed and result.outreach_rows == 4231
     assert result.outreach_views == ["final_outreach_users_r"]
     assert seeded.get_crawl_state(SYNC_KEY)["high_water"] == result.watermark
@@ -506,7 +514,8 @@ def test_an_unchanged_run_does_not_rebuild_the_dataset(seeded, pg):
     result = run(push(pg, seeded))
 
     assert result.counts["repositories"] == 1 and result.rows == 1  # registry only
-    assert not [e for e in FakeWriter.log if e[0] == "call"]
+    rebuilds = [e for e in FakeWriter.log if e[0] == "call" and "ensure_repo_schema" not in e[1]]
+    assert rebuilds == []  # the schema check runs every time; the rebuild must not
     assert not result.refreshed and result.refresh_error is None
 
 
@@ -535,7 +544,8 @@ def test_a_failed_data_push_moves_nothing(seeded, pg):
         run(push(pg, seeded, full=True))
 
     assert ("rollback",) in FakeWriter.log
-    assert not [e for e in FakeWriter.log if e[0] == "call"]  # no refresh of half data
+    rebuilds = [e for e in FakeWriter.log if e[0] == "call" and "ensure_repo_schema" not in e[1]]
+    assert rebuilds == []  # no refresh of half data
     assert seeded.get_crawl_state(SYNC_KEY) is None
 
 
@@ -563,3 +573,12 @@ def test_the_mirror_defaults_to_its_own_schema_not_public():
 
     assert Settings().supabase_schema == DEFAULT_SCHEMA == "gitscout"
     assert load_settings().supabase_schema == "gitscout"
+
+
+def test_rows_for_an_unregistered_repository_are_refused_not_misrouted(seeded, pg):
+    """A thread for a repo nobody registered has no schema to go to. Refusing is the
+    only safe answer: silently writing it into another repo's schema would mix data."""
+    FakeWriter.log = []
+    with pytest.raises(SupabaseError, match="not registered"):
+        run(push(pg, seeded, full=True))
+    assert ("rollback",) in FakeWriter.log

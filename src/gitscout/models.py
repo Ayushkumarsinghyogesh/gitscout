@@ -148,7 +148,7 @@ class ThreadComment:
     kind: str
     number: int
     comment_id: str
-    comment_type: str = "comment"  # comment | review | reply
+    comment_type: str = "comment"  # comment | review | reply | review_comment
     author: str | None = None
     author_type: str | None = None
     author_association: str | None = None
@@ -159,7 +159,9 @@ class ThreadComment:
     is_answer: bool | None = None  # discussions: this comment solved it
     upvotes: int | None = None
     review_state: str | None = None  # prs: APPROVED | CHANGES_REQUESTED | COMMENTED
-    parent_id: str | None = None  # replies: the comment they answer
+    parent_id: str | None = None  # replies: parent comment; review_comments: the review
+    url: str | None = None  # the comment's own GitHub link
+    file_path: str | None = None  # review_comments: the file the thread is on
 
 
 @dataclass(frozen=True)

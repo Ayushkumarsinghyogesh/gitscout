@@ -330,6 +330,7 @@ def comment(
     """An IssueComment or DiscussionComment node."""
     node: dict[str, Any] = {
         "id": comment_id,
+        "url": f"https://github.com/o/r/comments/{comment_id}",
         "createdAt": at,
         "updatedAt": at,
         "authorAssociation": association,
@@ -345,6 +346,22 @@ def comment(
     return node
 
 
+def review_comment(comment_id: str, author, *, review_id: str, path: str = "pkg/scan.go",
+                   body: str = "nit: rename this", at: str = "2026-01-04T01:00:00Z"):
+    """An inline code-review comment, as reviewThreads returns it."""
+    return {
+        "id": comment_id,
+        "url": f"https://github.com/o/r/pull/1#discussion_{comment_id}",
+        "createdAt": at,
+        "updatedAt": at,
+        "authorAssociation": "MEMBER",
+        "body": body,
+        "path": path,
+        "pullRequestReview": {"id": review_id},
+        "author": author,
+    }
+
+
 def review(
     review_id: str,
     author: dict[str, Any] | None,
@@ -357,6 +374,7 @@ def review(
     """A PullRequestReview node -- a verdict, with or without a body."""
     return {
         "id": review_id,
+        "url": f"https://github.com/o/r/reviews/{review_id}",
         "state": state,
         "body": body,
         "submittedAt": at,
@@ -459,6 +477,9 @@ def pr_node(
     head_ref: str = "fix/thing",
     review_decision: str | None = "APPROVED",
     reviews: Sequence[dict[str, Any]] = (),
+    reviews_has_next: bool = False,
+    reviews_cursor: str | None = None,
+    review_thread_comments: Sequence[dict[str, Any]] = (),
     **kw: Any,
 ) -> dict[str, Any]:
     """One node of the `PullRequestDetails` connection."""
@@ -478,7 +499,12 @@ def pr_node(
             "baseRefName": base_ref,
             "headRefName": head_ref,
             "reviewDecision": review_decision,
-            "reviews": connection(nodes=list(reviews)),
+            "reviews": connection(nodes=list(reviews), has_next=reviews_has_next,
+                                  cursor=reviews_cursor),
+            "reviewThreads": connection(
+                nodes=[{"comments": connection(nodes=list(review_thread_comments))}]
+                if review_thread_comments else []
+            ),
         }
     )
     return node

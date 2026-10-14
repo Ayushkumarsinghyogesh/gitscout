@@ -306,6 +306,7 @@ NATURALLY_NEWEST_FIRST = frozenset({"contribs"})
 _ISSUE_COMMENT_FIELDS = """
           nodes {
             id
+            url
             createdAt
             updatedAt
             authorAssociation
@@ -429,14 +430,37 @@ query PullRequestDetails(
     + """
         reviews(first: $comments) {
           totalCount
+          pageInfo { hasNextPage endCursor }
           nodes {
             id
+            url
             state
             body
             submittedAt
             updatedAt
             authorAssociation
             author { __typename login }
+          }
+        }
+        reviewThreads(first: 10) {
+          totalCount
+          pageInfo { hasNextPage endCursor }
+          nodes {
+            comments(first: 20) {
+              totalCount
+              pageInfo { hasNextPage endCursor }
+              nodes {
+                id
+                url
+                createdAt
+                updatedAt
+                authorAssociation
+                body
+                path
+                pullRequestReview { id }
+                author { __typename login }
+              }
+            }
           }
         }
         thread: comments(first: $comments) {
@@ -499,16 +523,19 @@ query DiscussionDetails(
           pageInfo { hasNextPage endCursor }
           nodes {
             id
+            url
             createdAt
             updatedAt
             body
             isAnswer
             upvoteCount
             author { __typename login }
-            replies(first: 5) {
+            replies(first: 50) {
               totalCount
+              pageInfo { hasNextPage endCursor }
               nodes {
                 id
+                url
                 createdAt
                 updatedAt
                 body
@@ -552,86 +579,6 @@ def thread_query(kind: str) -> tuple[str, tuple[str, ...]]:
     return body, path
 
 
-#: The newest comments of a thread longer than the per-thread cap. Paging a
-#: 400-comment thread forward would cost 20 queries for context nobody reads; the
-#: tail is where the current state of the conversation lives, so we take `last` and
-#: record that the middle is missing (`threads.comments_truncated`).
-_TAIL_BODIES = {
-    "issues": """
-query IssueCommentsTail($owner: String!, $name: String!, $number: Int!, $last: Int!) {
-"""
-    + _RATE_LIMIT
-    + """
-  repository(owner: $owner, name: $name) {
-    issue(number: $number) {
-      number
-      comments(last: $last) {
-        totalCount
-"""
-    + _ISSUE_COMMENT_FIELDS
-    + """
-      }
-    }
-  }
-}
-""",
-    "prs": """
-query PullRequestCommentsTail($owner: String!, $name: String!, $number: Int!, $last: Int!) {
-"""
-    + _RATE_LIMIT
-    + """
-  repository(owner: $owner, name: $name) {
-    pullRequest(number: $number) {
-      number
-      comments(last: $last) {
-        totalCount
-"""
-    + _ISSUE_COMMENT_FIELDS
-    + """
-      }
-    }
-  }
-}
-""",
-    "discussions": """
-query DiscussionCommentsTail($owner: String!, $name: String!, $number: Int!, $last: Int!) {
-"""
-    + _RATE_LIMIT
-    + """
-  repository(owner: $owner, name: $name) {
-    discussion(number: $number) {
-      number
-      comments(last: $last) {
-        totalCount
-        nodes {
-          id
-          createdAt
-          updatedAt
-          body
-          isAnswer
-          upvoteCount
-          author { __typename login }
-        }
-      }
-    }
-  }
-}
-""",
-}
-
-#: kind -> the path to the single thread a tail query returns.
-TAIL_PATHS: dict[str, tuple[str, ...]] = {
-    "issues": ("repository", "issue"),
-    "prs": ("repository", "pullRequest"),
-    "discussions": ("repository", "discussion"),
-}
-
-
-def tail_query(kind: str) -> tuple[str, tuple[str, ...]]:
-    """The tail document and the path to the thread it returns."""
-    if kind not in _TAIL_BODIES:
-        raise KeyError(kind)
-    return _TAIL_BODIES[kind], TAIL_PATHS[kind]
 
 
 # --------------------------------------------------------------- commit emails
@@ -837,6 +784,173 @@ query RepoInfo($owner: String!, $name: String!) {
     isArchived
     primaryLanguage { name }
     repositoryTopics(first: 10) { nodes { topic { name } } }
+  }
+}
+"""
+)
+
+
+# ------------------------------------------------------ filling capped threads
+
+#: One thread's comments, paged forward from a cursor. This is how a thread longer
+#: than the per-page cap is completed: start after the last stored position and walk
+#: to the end, instead of the old newest-slice "tail" approach that deliberately left
+#: a hole in the middle.
+_FILL_SHAPES = {
+    "issues": ("issue", "comments", _ISSUE_COMMENT_FIELDS),
+    "prs": ("pullRequest", "comments", _ISSUE_COMMENT_FIELDS),
+    "discussions": (
+        "discussion",
+        "comments",
+        """
+          nodes {
+            id
+            url
+            createdAt
+            updatedAt
+            body
+            isAnswer
+            upvoteCount
+            author { __typename login }
+            replies(first: 50) {
+              totalCount
+              pageInfo { hasNextPage endCursor }
+              nodes {
+                id
+                url
+                createdAt
+                updatedAt
+                body
+                author { __typename login }
+              }
+            }
+          }
+""",
+    ),
+}
+
+
+def fill_query(kind: str) -> tuple[str, tuple[str, ...]]:
+    """Document + connection path for paging one thread's comments to the end."""
+    field, connection, nodes = _FILL_SHAPES[kind]
+    document = (
+        f"""
+query Fill($owner: String!, $name: String!, $number: Int!, $first: Int!, $after: String) {{
+"""
+        + _RATE_LIMIT
+        + f"""
+  repository(owner: $owner, name: $name) {{
+    {field}(number: $number) {{
+      number
+      {connection}(first: $first, after: $after) {{
+        totalCount
+        pageInfo {{ hasNextPage endCursor }}
+{nodes}
+      }}
+    }}
+  }}
+}}
+"""
+    )
+    return document, ("repository", field, connection)
+
+
+#: Remaining reviews of one PR, paged from a cursor (the page query stops at the
+#: per-page cap and records the cursor).
+PR_REVIEWS_FILL = (
+    """
+query ReviewsFill($owner: String!, $name: String!, $number: Int!, $first: Int!, $after: String) {
+"""
+    + _RATE_LIMIT
+    + """
+  repository(owner: $owner, name: $name) {
+    pullRequest(number: $number) {
+      number
+      reviews(first: $first, after: $after) {
+        totalCount
+        pageInfo { hasNextPage endCursor }
+        nodes {
+          id
+          url
+          state
+          body
+          submittedAt
+          updatedAt
+          authorAssociation
+          author { __typename login }
+        }
+      }
+    }
+  }
+}
+"""
+)
+
+#: Inline code-review comments. They live on `reviewThreads`, a connection the page
+#: query never touches, so until this existed they were not collected at all. Each
+#: comment names the review it belongs to (`pullRequestReview`), which becomes
+#: `parent_id`, and the file path rides along as metadata.
+PR_REVIEW_THREADS = (
+    """
+query ReviewThreads($owner: String!, $name: String!, $number: Int!, $first: Int!, $after: String) {
+"""
+    + _RATE_LIMIT
+    + """
+  repository(owner: $owner, name: $name) {
+    pullRequest(number: $number) {
+      number
+      reviewThreads(first: $first, after: $after) {
+        totalCount
+        pageInfo { hasNextPage endCursor }
+        nodes {
+          isResolved
+          path
+          comments(first: 50) {
+            totalCount
+            pageInfo { hasNextPage endCursor }
+            nodes {
+              id
+              url
+              createdAt
+              updatedAt
+              authorAssociation
+              body
+              path
+              pullRequestReview { id }
+              author { __typename login }
+            }
+          }
+        }
+      }
+    }
+  }
+}
+"""
+)
+
+#: Remaining replies of one discussion comment, paged from a cursor.
+DISCUSSION_REPLIES_FILL = (
+    """
+query RepliesFill($id: ID!, $first: Int!, $after: String) {
+"""
+    + _RATE_LIMIT
+    + """
+  node(id: $id) {
+    ... on DiscussionComment {
+      id
+      replies(first: $first, after: $after) {
+        totalCount
+        pageInfo { hasNextPage endCursor }
+        nodes {
+          id
+          url
+          createdAt
+          updatedAt
+          body
+          author { __typename login }
+        }
+      }
+    }
   }
 }
 """

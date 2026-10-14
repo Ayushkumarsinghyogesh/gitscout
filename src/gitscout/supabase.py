@@ -60,8 +60,14 @@ TARGETS: tuple[tuple[str, str, str], ...] = (
     ("interactions", "interactions", "repo,login,kind"),
 )
 
-#: Where the mirror lives. A schema of its own, so the host project's `public` stays
-#: exactly as its own migrations describe it.
+#: Tables that hold one repository's data and therefore live in that repository's
+#: own schema (`defendermate_<name>_gitscout`). Everything else -- people, their
+#: addresses, the registry, the audit log -- is shared and stays in `gitscout`: a
+#: person who is active in two repositories is one person, not two rows to enrich.
+REPO_SCOPED = frozenset({"threads", "comments", "interactions"})
+
+#: Where the shared tables live. A schema of its own, so the host project's `public`
+#: stays exactly as its own migrations describe it.
 DEFAULT_SCHEMA = "gitscout"
 
 #: Columns the remote schema does not have, dropped before sending. PostgREST rejects
@@ -587,6 +593,30 @@ def _push_postgres(
     marks: list[str] = []
 
     with PostgresWriter(dsn, batch=settings.supabase_batch) as db:
+        # Every registered repository gets its schema (created on first sight) before
+        # any row is routed to it. Inside the same transaction, so a half-made schema
+        # can never outlive a failed push.
+        schema_for: dict[str, str] = {
+            r["repo"]: db.scalar(f"select {schema}.ensure_repo_schema(%s)", [r["repo"]])
+            for r in store.sync_repositories()
+        }
+
+        def write(name: str, table: str, conflict: str, rows: Sequence[Mapping[str, Any]]) -> None:
+            if name not in REPO_SCOPED:
+                db.upsert(f"{schema}.{table}", _prepare(name, rows), on_conflict=conflict)
+                return
+            by_repo: dict[str, list[Mapping[str, Any]]] = {}
+            for row in rows:
+                by_repo.setdefault(row["repo"], []).append(row)
+            for repo, chunk in by_repo.items():
+                target = schema_for.get(repo)
+                if target is None:
+                    raise SupabaseError(
+                        f"{repo} has {name} rows but is not registered; run "
+                        f"`gitscout repo-info {repo}` first"
+                    )
+                db.upsert(f"{target}.{table}", _prepare(name, chunk), on_conflict=conflict)
+
         if streaming:
             readers = _readers(store)
             for name, table, conflict in TARGETS:
@@ -596,7 +626,7 @@ def _push_postgres(
                 if mark:
                     marks.append(mark)
                 if rows:
-                    db.upsert(f"{schema}.{table}", _prepare(name, rows), on_conflict=conflict)
+                    write(name, table, conflict, rows)
                 del rows
         else:
             payload = collect(store, since, only_with_email=only_with_email, limit=limit)
@@ -605,9 +635,8 @@ def _push_postgres(
             if mark:
                 marks.append(mark)
             for name, table, conflict in TARGETS:
-                rows = _prepare(name, payload[name])
-                if rows:
-                    db.upsert(f"{schema}.{table}", rows, on_conflict=conflict)
+                if payload[name]:
+                    write(name, table, conflict, payload[name])
         db.upsert(
             f"{schema}.sync_runs",
             [{
