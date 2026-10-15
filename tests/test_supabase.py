@@ -454,9 +454,11 @@ class FakeWriter:
             if FakeWriter.fail_on == "refresh":
                 raise SupabaseError("simulated refresh failure")
             return 4231
+        # the database names repository objects: upper-case, hyphens, so quoting matters
+        label = "Defendermate-Github1-" + params[0].split("/")[1].capitalize()
         if "ensure_repo_schema" in sql:
-            return "defendermate_" + params[0].split("/")[1] + "_gitscout"
-        return "final_outreach_users_" + params[0].split("/")[1]
+            return label
+        return label + "-Final"
 
 
 @pytest.fixture
@@ -489,9 +491,9 @@ def test_a_full_postgres_push_lands_everything_then_refreshes(seeded, pg):
     # registry first, parents before children, audit row last
     assert tables[0] == "gitscout.repositories" and tables[-1] == "gitscout.sync_runs"
     assert tables.index("gitscout.people") < tables.index("gitscout.person_emails")
-    assert "defendermate_r_gitscout.threads" in tables
-    assert tables.index("defendermate_r_gitscout.threads") < tables.index("defendermate_r_gitscout.comments")
-    assert "defendermate_r_gitscout.interactions" in tables
+    assert '"Defendermate-Github1-R".threads' in tables
+    assert tables.index('"Defendermate-Github1-R".threads') < tables.index('"Defendermate-Github1-R".comments')
+    assert '"Defendermate-Github1-R".interactions' in tables
     assert not any(t.startswith("gitscout.threads") or t.startswith("gitscout.comments") for t in tables)
     # the repo schema is ensured inside the data transaction, before its rows
     calls = [e[1] for e in FakeWriter.log if e[0] == "call"]
@@ -501,7 +503,7 @@ def test_a_full_postgres_push_lands_everything_then_refreshes(seeded, pg):
     # data commits BEFORE any view or refresh call
     assert calls[1:] == ["select gitscout.ensure_outreach_view(%s)", "select gitscout.refresh_outreach()"]
     assert result.refreshed and result.outreach_rows == 4231
-    assert result.outreach_views == ["final_outreach_users_r"]
+    assert result.outreach_views == ["Defendermate-Github1-R-Final"]
     assert seeded.get_crawl_state(SYNC_KEY)["high_water"] == result.watermark
     assert seeded.get_crawl_state(REFRESH_KEY)["done"] is True
 

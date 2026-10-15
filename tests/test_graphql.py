@@ -158,6 +158,32 @@ def test_server_error_is_retried(gql, make_gql_client):
     assert len(gql.calls) == 2
 
 
+def test_truncated_body_is_retried(gql, make_gql_client):
+    # A 200 whose JSON stops mid-way: the connection was cut while reading the body.
+    # This ended a 200-page backfill once; it must be retried like a 5xx.
+    gql.add_raw("Probe", '{"data":{"rateLimit":{"cost":5,"remaining":4475,"resetAt":"20')
+    gql.add("Probe", {"thing": {"ok": 3}})
+
+    async def go():
+        async with make_gql_client(gql) as client:
+            return await client.execute(PROBE)
+
+    assert run(go()).pluck("thing", "ok") == 3
+    assert len(gql.calls) == 2
+
+
+def test_truncated_body_gives_up_after_max_retries(gql, make_gql_client):
+    gql.add_raw("Probe", '{"data":{"rateLimit":{')
+
+    async def go():
+        async with make_gql_client(gql, max_retries=2) as client:
+            return await client.execute(PROBE)
+
+    with pytest.raises(GraphQLError, match="non-JSON after retries"):
+        run(go())
+    assert len(gql.calls) == 3
+
+
 def test_403_with_retry_after_backs_off(gql, make_gql_client):
     gql.add_body("Probe", {"message": "slow down"}, status=403)
     gql.add("Probe", {"thing": {"ok": 4}})

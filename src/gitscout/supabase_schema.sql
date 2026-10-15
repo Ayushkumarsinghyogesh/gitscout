@@ -1,33 +1,57 @@
--- gitscout -> Supabase mirror
+-- gitscout -> Supabase mirror: the canonical shape
 --
--- Run once in the Supabase SQL editor (`gitscout supabase schema -o schema.sql`).
--- Idempotent: re-running adds what is missing and changes nothing else.
+-- `gitscout supabase schema -o schema.sql`, then run it once in the Supabase SQL editor
+-- of a NEW project. Idempotent: re-running adds what is missing and changes nothing
+-- else. A project that already holds the mirror is carried forward by the numbered
+-- files in migrations/ instead; this file is what those add up to (0008d, 2026-10-14).
 --
--- Everything lives in its own `gitscout` schema, NOT in `public`. The host project's
--- `public` schema is described by its own migration history, and dropping unrelated
--- tables into it makes the repo and the database disagree. A separate schema also
--- means permissions can be granted or revoked in one statement.
+-- Three places, by what the data is:
 --
---   gitscout.people          one row per GitHub user
---   gitscout.person_emails   every address found for them, with provenance
---   gitscout.threads         issues, pull requests and discussions
---   gitscout.comments        comments, reviews and replies on those threads
---   gitscout.sync_runs       append-only log of each push
+--   gitscout.*                          shared. One person is one row however many
+--                                       repositories they are active in.
+--       people                          one row per GitHub user
+--       person_emails                   every address found for them, with provenance
+--       repositories                    the registry: owner/name -> GitHub's stable id
+--       sync_runs                       append-only log of each push and refresh
 --
--- plus views that are the way you actually read it:
+--   "Defendermate-Github1-<Name>".*      one schema per repository, created by
+--                                       gitscout.ensure_repo_schema() on first push.
+--       threads                         issues, pull requests and discussions
+--       comments                        comments, reviews, replies, inline code comments
+--       interactions                    forks, commits, stars: signals with no thread
+--       ("Defendermate-Github1-Trivy" is created here and is the template the
+--        function copies -- same columns, indexes, checks, RLS and grants.)
 --
---   gitscout.issues          \ the three sections, split out
---   gitscout.pull_requests   /  so you never write "where kind = ..."
---   gitscout.discussions    /
---   gitscout.participation   who was involved in what, and how
---   gitscout.engagement      the big one: person + their email + the thread + its labels
---   gitscout.contactable     people with an email, best lead first
+--   "Defendermate2".final_outreach_users          what the outreach team reads: one row
+--                                                 per (repository, person), 42 columns,
+--                                                 every thread they touched with its full
+--                                                 description and their own comments inline,
+--                                                 materialized, refreshed after each push
+--   "Defendermate2"."Defendermate-Github1-<Name>-Final"   the same, one repository
+--
+-- and the way to read the mirror itself:
+--
+--   gitscout.threads_all / comments_all / interactions_all   every repository, one view
+--   gitscout.issues / pull_requests / discussions           the three sections
+--   gitscout.participation                                  who was involved in what
+--   gitscout.engagement                                     person + email + thread + labels
+--   gitscout.thread_detail (+ issue_/discussion_/pr_detail)  one row per (person, thread)
+--                                                           with the whole conversation
+--   gitscout.contactable                                    people with an email
+--   gitscout.details_for(logins, sections) / people_in(repo, section, number)
+--
+-- Access: anon and authenticated get nothing -- no USAGE on any of these schemas, RLS
+-- on every table with no policy for them, every view security_invoker. The only
+-- non-superuser that can touch the mirror is gitscout_writer: select/insert/update on
+-- the tables, execute on three functions, no delete, no DDL. Its password is set out of
+-- band (`alter role gitscout_writer login password '...'`) and lives only in .env.
 --
 -- Types are the narrowest thing that cannot overflow: counts are smallint, confidence
 -- is numeric(3,2) because it is always 0.00-1.00, timestamps are timestamptz because
 -- gitscout stores UTC ISO-8601 throughout. Nothing is text where a real type exists.
 
 create schema if not exists gitscout;
+revoke all on schema gitscout from anon, authenticated;
 
 -- ---------------------------------------------------------------------- people
 
@@ -77,7 +101,13 @@ create table if not exists gitscout.people (
     activity_hours_utc    jsonb,         -- {"0": 3, "9": 41, ...} UTC hour -> events
 
     github_fetched_at     timestamptz,   -- when gitscout last refreshed the profile
-    synced_at             timestamptz  not null default now()
+    synced_at             timestamptz  not null default now(),
+
+    -- from the person's own profile (socialAccounts, or a LinkedIn link in the
+    -- website field), canonicalised to https://www.linkedin.com/in/<slug>
+    linkedin_url          text,
+    public_repos_count    integer,
+    last_enriched_at      timestamptz
 );
 
 -- Most queries are "contactable leads, best first", and ~40% of rows have no address,
@@ -88,6 +118,8 @@ create index if not exists people_score_idx
     on gitscout.people (lead_score desc nulls last);
 create index if not exists people_company_idx
     on gitscout.people (company) where company is not null;
+create index if not exists people_linkedin_idx
+    on gitscout.people (linkedin_url) where linkedin_url is not null;
 -- GIN so `where signals @> '{contribs}'` is an index scan.
 create index if not exists people_signals_idx on gitscout.people using gin (signals);
 
@@ -103,11 +135,59 @@ create table if not exists gitscout.person_emails (
 
 create index if not exists person_emails_email_idx on gitscout.person_emails (email);
 
--- --------------------------------------------------------------------- threads
+-- ---------------------------------------------------------------- repositories
+--
+-- Every repository-scoped row carries `repo` = 'owner/name'. That name changes when
+-- a repository is renamed or transferred; GitHub's databaseId does not. The registry
+-- holds the stable id once, and everything joins to it by name.
 
-create table if not exists gitscout.threads (
+create table if not exists gitscout.repositories (
+    repo               text primary key,          -- owner/name
+    repository_id      bigint unique,             -- GitHub databaseId, stable
+    node_id            text,
+    owner              text,
+    name               text,
+    url                text,
+    description        text,
+    homepage           text,
+    stars              integer,
+    forks              integer,
+    language           text,
+    topics             text[]      not null default '{}',
+    is_archived        boolean,
+    github_fetched_at  timestamptz,
+    synced_at          timestamptz not null default now()
+);
+
+create table if not exists gitscout.sync_runs (
+    id              serial primary key,
+    mode            text        not null,       -- full | incremental | refresh
+    since           timestamptz,
+    people          integer     not null default 0,
+    person_emails   integer     not null default 0,
+    threads         integer     not null default 0,
+    comments        integer     not null default 0,
+    seconds         numeric(8,2),
+    status          text        not null default 'ok',
+    error           text,
+    started_at      timestamptz not null default now()
+);
+
+-- ------------------------------------------------- one schema per repository
+--
+-- Trivy's schema is created here because gitscout.ensure_repo_schema() clones it
+-- (CREATE TABLE ... LIKE ... INCLUDING ALL) for every repository that follows. The
+-- name is gitscout.repo_schema_name(): "Defendermate-Github1-<Name>" (Trivy for trivy),
+-- non-alphanumerics folded to '-'. Upper-case and hyphens: always double-quoted.
+
+create schema if not exists "Defendermate-Github1-Trivy";
+revoke all on schema "Defendermate-Github1-Trivy" from anon, authenticated;
+
+create table if not exists "Defendermate-Github1-Trivy".threads (
     repo               text        not null,
-    kind               text        not null check (kind in ('issues', 'prs', 'discussions')),
+    kind               text        not null
+                                   constraint threads_kind_check
+                                   check (kind in ('issues', 'prs', 'discussions')),
     number             integer     not null,
     url                text,
     title              text,
@@ -129,8 +209,8 @@ create table if not exists gitscout.threads (
     milestone          text,
     participants       text[]      not null default '{}',
     node_id            text,
-    comments_stored    smallint    not null default 0,       -- what we actually fetched
-    comments_truncated boolean     not null default false,
+    comments_stored    smallint    not null default 0,       -- what we actually hold
+    comments_truncated boolean     not null default false,   -- true only while a gap remains
 
     -- pull requests
     merged             boolean,
@@ -160,20 +240,22 @@ create table if not exists gitscout.threads (
 );
 
 create index if not exists threads_author_idx
-    on gitscout.threads (author) where author is not null;
+    on "Defendermate-Github1-Trivy".threads (author) where author is not null;
 create index if not exists threads_kind_created_idx
-    on gitscout.threads (kind, created_at desc);
-create index if not exists threads_labels_idx on gitscout.threads using gin (labels);
+    on "Defendermate-Github1-Trivy".threads (kind, created_at desc);
+create index if not exists threads_labels_idx
+    on "Defendermate-Github1-Trivy".threads using gin (labels);
 create index if not exists threads_category_idx
-    on gitscout.threads (category) where category is not null;
+    on "Defendermate-Github1-Trivy".threads (category) where category is not null;
 
-create table if not exists gitscout.comments (
+create table if not exists "Defendermate-Github1-Trivy".comments (
     repo               text        not null,
     kind               text        not null,
     number             integer     not null,
     comment_id         text        not null,
     comment_type       text        not null default 'comment'
-                                   check (comment_type in ('comment', 'review', 'reply')),
+                                   constraint comments_comment_type_check
+                                   check (comment_type in ('comment', 'review', 'reply', 'review_comment')),
     author             text,
     author_type        text,
     author_association text,
@@ -184,63 +266,161 @@ create table if not exists gitscout.comments (
     is_answer          boolean,                 -- discussions: this one solved it
     upvotes            integer,
     review_state       text,                    -- APPROVED | CHANGES_REQUESTED | ...
-    parent_id          text,                    -- replies: the comment they answer
+    parent_id          text,                    -- replies: the comment; review_comment: the review
     synced_at          timestamptz not null default now(),
+    url                text,                    -- the comment's own GitHub link
+    file_path          text,                    -- review_comment only: the file it is on
     primary key (repo, kind, number, comment_id),
     foreign key (repo, kind, number)
-        references gitscout.threads (repo, kind, number) on delete cascade
+        references "Defendermate-Github1-Trivy".threads (repo, kind, number) on delete cascade
 );
+
+comment on column "Defendermate-Github1-Trivy".comments.comment_type is
+    'comment = ordinary thread comment; review = a PR review verdict (body may be '
+    'empty); reply = a discussion reply (parent_id = the comment); review_comment = '
+    'an inline code comment on a PR (parent_id = the review).';
+comment on column "Defendermate-Github1-Trivy".comments.url is
+    'The comment''s own GitHub link, as returned by the API.';
+comment on column "Defendermate-Github1-Trivy".comments.file_path is
+    'review_comment only: the file the review thread is on.';
 
 create index if not exists comments_author_idx
-    on gitscout.comments (author) where author is not null;
+    on "Defendermate-Github1-Trivy".comments (author) where author is not null;
 -- "who answered someone's question" is the highest-signal query in the whole mirror.
 create index if not exists comments_answer_idx
-    on gitscout.comments (author) where is_answer;
+    on "Defendermate-Github1-Trivy".comments (author) where is_answer;
 
-create table if not exists gitscout.sync_runs (
-    id              serial primary key,
-    mode            text        not null,       -- full | incremental
-    since           timestamptz,
-    people          integer     not null default 0,
-    person_emails   integer     not null default 0,
-    threads         integer     not null default 0,
-    comments        integer     not null default 0,
-    seconds         numeric(8,2),
-    status          text        not null default 'ok',
-    error           text,
-    started_at      timestamptz not null default now()
+-- One row per person per repo per kind (forks, issues, prs, discussions, contribs,
+-- stars). Threads cover issues/PRs/discussions in depth; this is what carries forks
+-- and commits, which have no thread.
+create table if not exists "Defendermate-Github1-Trivy".interactions (
+    repo               text        not null,
+    login              text        not null,
+    kind               text        not null,
+    user_type          text,
+    occurred_at        timestamptz,
+    extra              text,                      -- fork full name, commit oid, url
+    first_recorded_at  timestamptz,
+    synced_at          timestamptz not null default now(),
+    primary key (repo, login, kind)
 );
 
--- ----------------------------------------------------------------------- views
+create index if not exists interactions_login_idx
+    on "Defendermate-Github1-Trivy".interactions (login);
 
-create or replace view gitscout.issues as
-    select * from gitscout.threads where kind = 'issues';
+-- ------------------------------------------------------ least-privilege writer
+--
+-- Created without a password and unable to log in. The password is set once, out of
+-- band, so it never appears in a file in this repository:
+--     alter role gitscout_writer login password '<generated>';
 
-create or replace view gitscout.pull_requests as
-    select * from gitscout.threads where kind = 'prs';
+do $$
+begin
+    if not exists (select 1 from pg_roles where rolname = 'gitscout_writer') then
+        create role gitscout_writer nologin;
+    end if;
+end
+$$;
 
-create or replace view gitscout.discussions as
-    select * from gitscout.threads where kind = 'discussions';
+grant usage on schema gitscout, "Defendermate-Github1-Trivy" to gitscout_writer;
+grant select, insert, update on
+    gitscout.repositories, gitscout.people, gitscout.person_emails,
+    "Defendermate-Github1-Trivy".threads, "Defendermate-Github1-Trivy".comments,
+    "Defendermate-Github1-Trivy".interactions
+    to gitscout_writer;
+grant select, insert on gitscout.sync_runs to gitscout_writer;
+grant usage, select on sequence gitscout.sync_runs_id_seq to gitscout_writer;
 
--- Involved = opened it, commented on it, or reviewed it. One row per person per
--- thread: MIN() resolves someone who did several things to the strongest role, and
--- the names are alphabetical on purpose ('author' < 'commenter' < 'reviewer').
-create or replace view gitscout.participation as
+-- RLS on with zero policies blocks every non-bypass role, anon and authenticated
+-- included. The writer gets exactly the access above through one policy per table,
+-- and no one else gets anything.
+do $$
+declare
+    t text;
+begin
+    foreach t in array array[
+        'gitscout.repositories', 'gitscout.people', 'gitscout.person_emails',
+        'gitscout.sync_runs',
+        '"Defendermate-Github1-Trivy".threads', '"Defendermate-Github1-Trivy".comments',
+        '"Defendermate-Github1-Trivy".interactions']
+    loop
+        execute format('alter table %s enable row level security', t);
+        if not exists (select 1 from pg_policy
+                        where polrelid = t::regclass and polname = 'gitscout_writer_rw') then
+            execute format(
+                'create policy gitscout_writer_rw on %s for all '
+                'to gitscout_writer using (true) with check (true)', t);
+        end if;
+    end loop;
+end
+$$;
+
+-- ------------------------------------------- every repository, through one view
+--
+-- gitscout.threads_all / comments_all / interactions_all are UNION ALL over every
+-- "Defendermate-Github1-*" schema. The named views below read those, so adding a
+-- repository never touches a view by hand: gitscout.ensure_repo_schema() creates the
+-- schema and rebuilds the unions, and the push calls it for each registered repo.
+
+create or replace function gitscout.rebuild_union_views()
+returns void
+language plpgsql
+security definer
+set search_path = ''
+as $$
+declare
+    t     text;
+    parts text;
+    s     record;
+begin
+    foreach t in array array['threads', 'comments', 'interactions'] loop
+        parts := null;
+        for s in select nspname from pg_namespace
+                  where nspname ~ '^Defendermate-Github1-' order by nspname loop
+            if to_regclass(format('%I.%I', s.nspname, t)) is not null then
+                parts := concat_ws(' union all ', parts,
+                                   format('select * from %I.%I', s.nspname, t));
+            end if;
+        end loop;
+        if parts is null then
+            raise exception 'no repository schema holds a % table', t;
+        end if;
+        execute format('create or replace view gitscout.%I with (security_invoker = true) as %s',
+                       t || '_all', parts);
+        execute format('revoke all on gitscout.%I from anon, authenticated', t || '_all');
+    end loop;
+end
+$$;
+
+revoke execute on function gitscout.rebuild_union_views() from public, anon, authenticated;
+select gitscout.rebuild_union_views();
+
+-- The ten gitscout views were bound to trivy's tables by OID when the tables moved.
+-- They are recreated from their canonical definitions, reading the union views, so
+-- they cover every repository. Same columns, same order: CREATE OR REPLACE applies.
+create or replace view gitscout.issues with (security_invoker = true) as
+    select * from gitscout.threads_all where kind = 'issues';
+
+create or replace view gitscout.pull_requests with (security_invoker = true) as
+    select * from gitscout.threads_all where kind = 'prs';
+
+create or replace view gitscout.discussions with (security_invoker = true) as
+    select * from gitscout.threads_all where kind = 'discussions';
+
+create or replace view gitscout.participation with (security_invoker = true) as
 select repo, kind, number, login, author_type,
        min(role) as role
 from (
     select repo, kind, number, author as login, author_type, 'author' as role
-    from gitscout.threads where author is not null
+    from gitscout.threads_all where author is not null
     union all
     select repo, kind, number, author as login, author_type,
            case when comment_type = 'review' then 'reviewer' else 'commenter' end
-    from gitscout.comments where author is not null
+    from gitscout.comments_all where author is not null
 ) p
 group by repo, kind, number, login, author_type;
 
--- The one to start from: a person, how to reach them, and the thread they engaged
--- with -- title, body, labels, category and their own comments, already counted.
-create or replace view gitscout.engagement as
+create or replace view gitscout.engagement with (security_invoker = true) as
 select v.login,
        p.name,
        p.best_email,
@@ -264,15 +444,15 @@ select v.login,
        t.closed_at,
        t.comment_count,
        t.is_answered,
-       (select count(*) from gitscout.comments c
+       (select count(*) from gitscout.comments_all c
          where c.repo = v.repo and c.kind = v.kind
            and c.number = v.number and c.author = v.login) as own_comments
 from gitscout.participation v
-join gitscout.threads t
+join gitscout.threads_all t
   on t.repo = v.repo and t.kind = v.kind and t.number = v.number
 left join gitscout.people p on p.login = v.login;
 
-create or replace view gitscout.contactable as
+create or replace view gitscout.contactable with (security_invoker = true) as
 select login, name, best_email, email_source, email_confidence, lead_score, company,
        location, estimated_utc_offset, followers, signals,
        issues_opened, prs_opened, prs_reviewed, discussions_answered, last_seen_at
@@ -280,16 +460,7 @@ from gitscout.people
 where best_email is not null
 order by lead_score desc nulls last;
 
--- ------------------------------------------------- reading it for many people
---
--- The question this mirror exists to answer is "show me these people and what they
--- actually said". Doing that by hand means joining four tables and remembering which
--- side the emails hang off, so it is wrapped up here instead.
-
--- One row per (person, thread) with the entire conversation attached as JSON --
--- every comment carrying its author's email and timezone estimate, so a single row
--- is self-contained and nothing has to be joined back.
-create or replace view gitscout.thread_detail as
+create or replace view gitscout.thread_detail with (security_invoker = true) as
 select
     v.login,
     p.name,
@@ -327,7 +498,7 @@ select
     t.is_answered,
     t.answer_author,
     t.participants,
-    (select count(*) from gitscout.comments c
+    (select count(*) from gitscout.comments_all c
       where c.repo = t.repo and c.kind = t.kind and c.number = t.number
         and c.author = v.login)                as own_comments,
     (select jsonb_agg(jsonb_build_object(
@@ -344,24 +515,96 @@ select
                 'review_state',  c.review_state,
                 'body',          c.body)
             order by c.comment_type, c.position)
-       from gitscout.comments c
+       from gitscout.comments_all c
        left join gitscout.people cp on cp.login = c.author
       where c.repo = t.repo and c.kind = t.kind and c.number = t.number)
                                                as comments
 from gitscout.participation v
-join gitscout.threads t
+join gitscout.threads_all t
   on t.repo = v.repo and t.kind = v.kind and t.number = v.number
 left join gitscout.people p on p.login = v.login;
 
--- The three sections, pre-filtered.
-create or replace view gitscout.issue_detail as
+create or replace view gitscout.issue_detail with (security_invoker = true) as
     select * from gitscout.thread_detail where section = 'issues';
 
-create or replace view gitscout.discussion_detail as
+create or replace view gitscout.discussion_detail with (security_invoker = true) as
     select * from gitscout.thread_detail where section = 'discussions';
 
-create or replace view gitscout.pr_detail as
+create or replace view gitscout.pr_detail with (security_invoker = true) as
     select * from gitscout.thread_detail where section = 'prs';
+
+create or replace function gitscout.repo_schema_name(repo_full text)
+returns text
+language sql
+stable
+set search_path = ''
+as $$
+    select 'Defendermate-Github1-'
+           || initcap(regexp_replace(
+                  case when exists (select 1 from gitscout.repositories o
+                                     where o.repo <> r.repo and o.repo < r.repo
+                                       and lower(o.name) = lower(r.name))
+                       then r.owner || '-' || r.name
+                       else r.name end,
+                  '[^A-Za-z0-9]+', '-', 'g'))
+      from gitscout.repositories r
+     where r.repo = repo_full
+$$;
+
+create or replace function gitscout.ensure_repo_schema(repo_full text)
+returns text
+language plpgsql
+security definer
+set search_path = ''
+as $$
+declare
+    s text;
+    t text;
+begin
+    s := gitscout.repo_schema_name(repo_full);
+    if s is null then
+        raise exception 'repository % is not registered (run gitscout repo-info)', repo_full;
+    end if;
+
+    -- The names carry upper-case letters and hyphens: always through %I.
+    if to_regnamespace(format('%I', s)) is null then
+        execute format('create schema %I', s);
+    end if;
+    execute format('revoke all on schema %I from anon, authenticated', s);
+    execute format('grant usage on schema %I to gitscout_writer', s);
+
+    foreach t in array array['threads', 'comments', 'interactions'] loop
+        if to_regclass(format('%I.%I', s, t)) is null then
+            -- Trivy's tables are the template: same columns, indexes, checks, defaults.
+            execute format('create table %I.%I (like %I.%I including all)',
+                           s, t, 'Defendermate-Github1-Trivy', t);
+            execute format('alter table %I.%I enable row level security', s, t);
+            execute format('create policy gitscout_writer_rw on %I.%I for all to gitscout_writer '
+                           'using (true) with check (true)', s, t);
+            execute format('grant select, insert, update on %I.%I to gitscout_writer', s, t);
+        end if;
+    end loop;
+    -- LIKE does not copy foreign keys.
+    if not exists (select 1 from pg_constraint
+                    where conrelid = format('%I.comments', s)::regclass and contype = 'f') then
+        execute format('alter table %I.comments add foreign key (repo, kind, number) '
+                       'references %I.threads (repo, kind, number) on delete cascade', s, s);
+    end if;
+
+    perform gitscout.rebuild_union_views();
+    return s;
+end
+$$;
+
+revoke execute on function gitscout.repo_schema_name(text) from public, anon, authenticated;
+revoke execute on function gitscout.ensure_repo_schema(text) from public, anon, authenticated;
+grant execute on function gitscout.ensure_repo_schema(text) to gitscout_writer;
+
+-- ------------------------------------------------- reading it for many people
+--
+-- The question this mirror exists to answer is "show me these people and what they
+-- actually said". Doing that by hand means joining four tables and remembering which
+-- side the emails hang off, so it is wrapped up here instead.
 
 -- Many people at once:
 --     select * from gitscout.details_for(array['alice','bob'], array['issues']);
@@ -396,7 +639,7 @@ language sql
 stable
 as $$
     select v.login, p.name, p.best_email, v.role,
-           (select count(*) from gitscout.comments c
+           (select count(*) from gitscout.comments_all c
              where c.repo = v.repo and c.kind = v.kind
                and c.number = v.number and c.author = v.login),
            p.estimated_utc_offset, p.company, p.location
@@ -406,13 +649,308 @@ as $$
     order by v.role, v.login;
 $$;
 
--- ------------------------------------------------------------------------- RLS
+revoke execute on function gitscout.details_for(text[], text[]) from public, anon, authenticated;
+revoke execute on function gitscout.people_in(text, text, integer) from public, anon, authenticated;
+
+-- --------------------------------------------------- the final outreach dataset
 --
--- `service_role` bypasses RLS, so gitscout keeps writing with it on. Enabling it with
--- no policy for `anon`/`authenticated` is what keeps this out of a browser: these are
--- real people's addresses and the anon key ships to every client.
-alter table gitscout.people         enable row level security;
-alter table gitscout.person_emails  enable row level security;
-alter table gitscout.threads        enable row level security;
-alter table gitscout.comments       enable row level security;
-alter table gitscout.sync_runs      enable row level security;
+-- Lives in "Defendermate2", quoted on purpose: it matches the existing "Defendermate"
+-- schema's casing, and an unquoted name would fold to lower case.
+--
+-- Materialized because a plain view was measured at 69 s for a count (every row
+-- rebuilt its JSON detail on each read); stored, the same count is under 2 s. It is
+-- refreshed CONCURRENTLY after each push, so readers keep the previous result for the
+-- whole refresh and a failed refresh leaves the last good dataset serving.
+--
+-- Materialized views cannot carry RLS; access is by grants alone, and nothing is
+-- granted to anon or authenticated.
+
+create schema if not exists "Defendermate2";
+revoke all on schema "Defendermate2" from anon, authenticated;
+
+create materialized view if not exists "Defendermate2".final_outreach_users
+as
+with
+-- every (repo, person, thread) they took part in, with the thread's facts
+involvement as (
+    -- Built from the base tables. It used to read gitscout.participation and join
+    -- that GROUP BY result back to threads on (repo, kind, number); the planner then
+    -- estimated ONE row, chose a nested loop over 9,153 comment groups, and a refresh
+    -- took 143 s. From the base tables it takes about 3 s, same results.
+    select t.repo, t.kind, t.number, t.author as login, 'author'::text as role,
+           t.url, t.title, t.state, t.closed, t.labels, t.category, t.upvotes,
+           t.is_answered, t.merged, t.created_at, t.updated_at, t.author,
+           t.comment_count, t.additions, t.deletions,
+           t.body as description
+    from gitscout.threads_all t
+    where t.author is not null
+    union all
+    -- everyone else who wrote in the thread; 'commenter' < 'reviewer', so someone
+    -- who did both reads as commenter, the same rule as gitscout.participation
+    select t.repo, t.kind, t.number, c.login, c.role,
+           t.url, t.title, t.state, t.closed, t.labels, t.category, t.upvotes,
+           t.is_answered, t.merged, t.created_at, t.updated_at, t.author,
+           t.comment_count, t.additions, t.deletions,
+           t.body as description
+    from (select repo, kind, number, author as login,
+                 min(case when comment_type = 'review' then 'reviewer'
+                          else 'commenter' end) as role
+          from gitscout.comments_all
+          where author is not null
+          group by repo, kind, number, author) c
+    join gitscout.threads_all t
+      on t.repo = c.repo and t.kind = c.kind and t.number = c.number
+    where c.login is distinct from t.author
+),
+-- what each person wrote in each thread: counts, and their own messages as JSON.
+-- `json`, not `jsonb`, on purpose: jsonb stores keys shortest-first; json keeps the
+-- order they are built in, which is the order the outreach team reads them in.
+own as (
+    select c.repo, c.kind, c.number, c.author as login,
+           count(*) as own_comments,
+           bool_or(coalesce(c.is_answer, false)) as wrote_answer,
+           min(c.created_at) as first_comment_at,
+           max(c.created_at) as last_comment_at,
+           json_agg(json_build_object(
+               'type',         c.comment_type,
+               'author',       c.author,
+               'created_at',   c.created_at,
+               'url',          c.url,
+               'body',         c.body,
+               'is_answer',    c.is_answer,
+               'review_state', c.review_state,
+               'file_path',    c.file_path,
+               'reply_to',     p.author,
+               'parent_id',    c.parent_id)
+               order by c.created_at, c.comment_type, c.position) as comments
+    from gitscout.comments_all c
+    -- a discussion reply's parent is another person's (or their own) comment; an
+    -- inline code comment's parent is the person's own review, so reply_to is set
+    -- for replies only
+    left join gitscout.comments_all p
+      on p.repo = c.repo and p.kind = c.kind and p.number = c.number
+     and p.comment_id = c.parent_id and c.comment_type = 'reply'
+    where c.author is not null
+    group by c.repo, c.kind, c.number, c.author
+),
+per_thread as (
+    select i.*, coalesce(o.own_comments, 0) as own_comments,
+           coalesce(o.wrote_answer, false) as wrote_answer,
+           o.first_comment_at, o.last_comment_at,
+           coalesce(o.comments, '[]'::json) as comments
+    from involvement i
+    left join own o
+      on o.repo = i.repo and o.kind = i.kind
+     and o.number = i.number and o.login = i.login
+),
+threads_by_person as (
+    select repo, login,
+           count(*) filter (where kind = 'issues')      as issues_count,
+           count(*) filter (where kind = 'discussions') as discussions_count,
+           count(*) filter (where kind = 'prs')         as pull_requests_count,
+           count(*) filter (where kind = 'issues' and role = 'author')      as issues_opened,
+           count(*) filter (where kind = 'discussions' and role = 'author') as discussions_opened,
+           count(*) filter (where kind = 'prs' and role = 'author')         as prs_opened,
+           count(*) filter (where kind = 'prs' and role = 'reviewer')       as prs_reviewed,
+           count(*) filter (where wrote_answer)                             as discussions_answered,
+           json_agg(json_build_object(
+               'number', number, 'url', url, 'title', title,
+               'description', description,
+               'state', state, 'labels', labels,
+               'created_at', created_at, 'updated_at', updated_at,
+               'author', author, 'role', role, 'own_comments', own_comments,
+               'comments_count', comment_count, 'comments', comments)
+               order by created_at desc) filter (where kind = 'issues')      as issue_details,
+           json_agg(json_build_object(
+               'number', number, 'url', url, 'title', title,
+               'description', description,
+               'category', category, 'closed', closed, 'is_answered', is_answered,
+               'upvotes', upvotes, 'created_at', created_at, 'updated_at', updated_at,
+               'author', author, 'role', role, 'wrote_answer', wrote_answer,
+               'own_comments', own_comments,
+               'comments_count', comment_count, 'comments', comments)
+               order by created_at desc) filter (where kind = 'discussions') as discussion_details,
+           json_agg(json_build_object(
+               'number', number, 'url', url, 'title', title,
+               'description', description,
+               'state', state, 'merged', merged, 'additions', additions,
+               'deletions', deletions, 'created_at', created_at, 'updated_at', updated_at,
+               'author', author, 'role', role, 'own_comments', own_comments,
+               'comments_count', comment_count, 'comments', comments)
+               order by created_at desc) filter (where kind = 'prs')         as pull_request_details,
+           array_agg(distinct repo || '/' || kind || '/' || number)          as thread_ids,
+           min(least(created_at, first_comment_at))                          as first_thread_at,
+           max(greatest(created_at, last_comment_at))                        as last_thread_at
+    from per_thread
+    group by repo, login
+),
+signals_by_person as (
+    select repo, login,
+           array_agg(distinct kind)                                          as kinds,
+           count(*) filter (where kind = 'forks')                            as forks_count,
+           jsonb_agg(jsonb_build_object('fork', extra, 'forked_at', occurred_at))
+               filter (where kind = 'forks')                                 as fork_details,
+           array_agg(distinct repo || '/' || kind)                           as signal_ids,
+           min(occurred_at)                                                  as first_signal_at,
+           max(occurred_at)                                                  as last_signal_at
+    from gitscout.interactions_all
+    group by repo, login
+),
+-- everyone with any presence in a repository, from either source
+roster as (
+    select repo, login from threads_by_person
+    union
+    select repo, login from signals_by_person
+)
+select
+    r.repository_id,
+    r.owner                                    as repository_owner,
+    r.name                                     as repository_name,
+    r.url                                      as repository_url,
+    'github'                                   as platform,
+
+    p.login                                    as username,
+    -- Split only a plain two-or-more-word display name. A single word, or anything
+    -- with a comma or digits, is left whole in full_name rather than guessed at.
+    case when p.name ~ '^[^\s,0-9]+(\s+[^\s,0-9]+)+$'
+         then split_part(p.name, ' ', 1) end   as first_name,
+    case when p.name ~ '^[^\s,0-9]+(\s+[^\s,0-9]+)+$'
+         then substr(p.name, length(split_part(p.name, ' ', 1)) + 2) end as last_name,
+    p.name                                     as full_name,
+    'https://github.com/' || p.login           as profile_url,
+
+    p.best_email                               as email,
+    p.email_source,
+    -- No deliverability check has been run. NULL means "not verified", never "valid".
+    null::boolean                              as email_verified,
+    p.linkedin_url,
+
+    nullif(btrim(p.company, ' @'), '')         as company_name,
+    null::text                                 as company_website,
+    -- From the email only when it is a work address; free-mail domains say nothing
+    -- about an employer.
+    case when p.best_email is not null
+          and split_part(p.best_email, '@', 2) !~*
+              '^(gmail|googlemail|yahoo|ymail|hotmail|outlook|live|msn|icloud|me|mac|aol|protonmail|proton|pm|qq|163|126|foxmail|gmx|web|mail|yandex|zoho|hey|fastmail|tutanota|naver|daum)\.'
+         then lower(split_part(p.best_email, '@', 2)) end as company_domain,
+
+    p.location,
+    p.estimated_utc_offset,
+    p.bio,
+    p.followers                                as followers_count,
+    p.public_repos_count                       as public_repositories_count,
+
+    -- Counts are THIS person's involvement in THIS repository. Repository-wide totals
+    -- are the repository_* columns, never these.
+    coalesce(t.issues_count, 0)                as issues_count,
+    coalesce(t.issues_opened, 0)               as issues_opened,
+    t.issue_details,
+    coalesce(t.discussions_count, 0)           as discussions_count,
+    coalesce(t.discussions_answered, 0)        as discussions_answered,
+    t.discussion_details,
+    coalesce(t.pull_requests_count, 0)         as pull_requests_count,
+    coalesce(t.prs_opened, 0)                  as pull_requests_opened,
+    coalesce(t.prs_reviewed, 0)                as pull_requests_reviewed,
+    t.pull_request_details,
+    coalesce(s.forks_count, 0)                 as forks_count,
+    s.fork_details,
+    r.stars                                    as repository_stars_count,
+    r.forks                                    as repository_forks_count,
+
+    array(select distinct x from unnest(
+        coalesce(s.kinds, '{}')
+        || case when coalesce(t.discussions_answered, 0) > 0 then array['answered_discussion'] else '{}' end
+        || case when coalesce(t.prs_reviewed, 0) > 0 then array['reviewed_pr'] else '{}' end
+    ) as x order by x)                          as engagement_signals,
+
+
+    coalesce(t.thread_ids, '{}') || coalesce(s.signal_ids, '{}') as source_record_ids,
+
+    least(t.first_thread_at, s.first_signal_at)      as first_seen_at,
+    greatest(t.last_thread_at, s.last_signal_at)     as last_seen_at,
+    greatest(p.synced_at, p.github_fetched_at)       as last_updated_at,
+    p.last_enriched_at
+
+from roster x
+join gitscout.repositories r on r.repo = x.repo
+join gitscout.people p       on p.login = x.login
+left join threads_by_person t on t.repo = x.repo and t.login = x.login
+left join signals_by_person s on s.repo = x.repo and s.login = x.login
+-- people only: bots and organisations are signals about a repo, never prospects
+where coalesce(p.account_type, 'User') = 'User'
+  and p.login !~* '(\[bot\]|-bot|_bot)$';
+
+create unique index if not exists final_outreach_users_key
+    on "Defendermate2".final_outreach_users (repository_id, username);
+create index if not exists final_outreach_users_repo
+    on "Defendermate2".final_outreach_users (repository_owner, repository_name);
+create index if not exists final_outreach_users_email
+    on "Defendermate2".final_outreach_users (email) where email is not null;
+revoke all on "Defendermate2".final_outreach_users from anon, authenticated;
+
+-- SECURITY DEFINER: a materialized view can only be refreshed by its owner, and the
+-- scheduled writer must not own anything. search_path is pinned so the function
+-- cannot be redirected to an attacker's objects.
+create or replace function gitscout.refresh_outreach()
+returns integer
+language plpgsql
+security definer
+set search_path = ''
+as $$
+declare
+    started timestamptz := clock_timestamp();
+    total   integer;
+begin
+    -- CONCURRENTLY: readers keep the previous result for the whole refresh.
+    refresh materialized view concurrently "Defendermate2".final_outreach_users;
+    select count(*) into total from "Defendermate2".final_outreach_users;
+    insert into gitscout.sync_runs (mode, people, seconds, status)
+    values ('refresh', total, extract(epoch from clock_timestamp() - started), 'ok');
+    return total;
+end;
+$$;
+
+-- One view per registered repository: "Defendermate2"."Defendermate-Github1-<Name>-Final",
+-- named after the repository's schema.
+create or replace function gitscout.ensure_outreach_view(repo_full text)
+returns text
+language plpgsql
+security definer
+set search_path = ''
+as $$
+declare
+    r_owner   text;
+    r_name    text;
+    view_name text;
+begin
+    select owner, name into r_owner, r_name
+    from gitscout.repositories where repo = repo_full;
+    if r_name is null then
+        raise exception 'repository % is not registered (run gitscout repo-info)', repo_full;
+    end if;
+    view_name := gitscout.repo_schema_name(repo_full) || '-Final';
+
+    execute format(
+        'create or replace view %I.%I with (security_invoker = true) as '
+        'select * from %I.final_outreach_users '
+        'where repository_owner = %L and repository_name = %L',
+        'Defendermate2', view_name, 'Defendermate2', r_owner, r_name);
+    execute format('revoke all on %I.%I from anon, authenticated', 'Defendermate2', view_name);
+    return view_name;
+end;
+$$;
+
+revoke execute on function gitscout.refresh_outreach() from public, anon, authenticated;
+revoke execute on function gitscout.ensure_outreach_view(text) from public, anon, authenticated;
+
+grant execute on function gitscout.refresh_outreach() to gitscout_writer;
+grant execute on function gitscout.ensure_outreach_view(text) to gitscout_writer;
+
+-- Future functions created in these schemas start closed instead of open (Postgres's
+-- default grants EXECUTE to PUBLIC on every new function).
+alter default privileges in schema gitscout revoke execute on functions from public;
+alter default privileges in schema "Defendermate2" revoke execute on functions from public;
+
+-- The per-repository views ("Defendermate2"."Defendermate-Github1-<Name>-Final") are not
+-- created here: the push creates one for each registered repository through
+-- gitscout.ensure_outreach_view(), which needs the registry row to name it.

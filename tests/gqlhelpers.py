@@ -216,7 +216,7 @@ class FakeGraphQL:
     """Scripted GraphQL endpoint. Responses are queued per operation name."""
 
     def __init__(self) -> None:
-        self.queue: dict[str, list[tuple[int, dict[str, Any]]]] = {}
+        self.queue: dict[str, list[tuple[int, dict[str, Any] | str]]] = {}
         self.calls: list[tuple[str, dict[str, Any], dict[str, str]]] = []
         self.rest: dict[str, Any] = {}
         self.rest_calls: list[tuple[str, dict[str, str]]] = []
@@ -255,6 +255,11 @@ class FakeGraphQL:
     def add_status(self, op: str, status: int, text: str = "boom") -> "FakeGraphQL":
         return self.add_body(op, {"message": text}, status=status)
 
+    def add_raw(self, op: str, text: str, status: int = 200) -> "FakeGraphQL":
+        """Queue a response body sent as-is -- e.g. JSON cut off mid-read."""
+        self.queue.setdefault(op, []).append((status, text))
+        return self
+
     def _with_limit(self, data: dict[str, Any], **kw: Any) -> dict[str, Any]:
         out = dict(data)
         out.setdefault("rateLimit", {**DEFAULT_RATE_LIMIT, **kw})
@@ -287,6 +292,8 @@ class FakeGraphQL:
                 headers=self.headers,
             )
         status, body = pending.pop(0) if len(pending) > 1 else pending[0]
+        if isinstance(body, str):
+            return httpx.Response(status, text=body, headers=self.headers)
         return httpx.Response(status, json=body, headers=self.headers)
 
     @property

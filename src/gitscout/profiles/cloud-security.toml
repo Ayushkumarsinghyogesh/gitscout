@@ -21,7 +21,7 @@
 # ACTIVE TARGETS -- this file is the scheduled run's repository list.
 # Uncomment a [[target]] block (or add one) and the next scheduled run picks it up:
 # it is registered, crawled from scratch, pushed, and gets its own
-# "Defendermate2".final_outreach_users_<name> view. Nothing else to change.
+# "Defendermate2"."Defendermate-Github1-<Name>-Final" view. Nothing else to change.
 
 name = "cloud-security"
 description = "CSPM, IaC scanning, container & k8s security, secret detection"

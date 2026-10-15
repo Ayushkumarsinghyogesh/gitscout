@@ -61,7 +61,7 @@ TARGETS: tuple[tuple[str, str, str], ...] = (
 )
 
 #: Tables that hold one repository's data and therefore live in that repository's
-#: own schema (`defendermate_<name>_gitscout`). Everything else -- people, their
+#: own schema (`"Defendermate-Github1-<Name>"`). Everything else -- people, their
 #: addresses, the registry, the audit log -- is shared and stays in `gitscout`: a
 #: person who is active in two repositories is one person, not two rows to enrich.
 REPO_SCOPED = frozenset({"threads", "comments", "interactions"})
@@ -548,6 +548,12 @@ REFRESH_KEY = "supabase:refresh"
 _IDENTIFIER = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")
 
 
+def _quoted(schema: str) -> str:
+    """A repository schema name as the database chose it -- upper-case letters and
+    hyphens (``Defendermate-Github1-Trivy``) -- so it must be double-quoted."""
+    return '"' + schema.replace('"', '""') + '"'
+
+
 def _schema(settings: Settings) -> str:
     schema = settings.supabase_schema or DEFAULT_SCHEMA
     if not _IDENTIFIER.match(schema):
@@ -615,7 +621,7 @@ def _push_postgres(
                         f"{repo} has {name} rows but is not registered; run "
                         f"`gitscout repo-info {repo}` first"
                     )
-                db.upsert(f"{target}.{table}", _prepare(name, chunk), on_conflict=conflict)
+                db.upsert(f"{_quoted(target)}.{table}", _prepare(name, chunk), on_conflict=conflict)
 
         if streaming:
             readers = _readers(store)

@@ -230,7 +230,16 @@ class GraphQLClient:
             try:
                 body = resp.json()
             except ValueError as exc:
-                raise GraphQLError(f"GraphQL returned non-JSON: {resp.text[:200]}") from exc
+                # A 200 whose body does not parse is a connection cut mid-read -- GitHub
+                # does not send malformed JSON -- so it is retried like a transport error.
+                # Seen once per few thousand pages; without this it ended a backfill.
+                attempt += 1
+                if attempt > self._max_retries:
+                    raise GraphQLError(
+                        f"GraphQL returned non-JSON after retries: {resp.text[:200]}"
+                    ) from exc
+                await self._sleep(min(2**attempt, 30))
+                continue
 
             self.queries_sent += 1
             data = body.get("data") or {}
