@@ -14,3 +14,6 @@ note.txt
 personaldocs.txt
 logs/
 *.db.lock
+
+# Handover and access notes: private discussion, never published
+private/

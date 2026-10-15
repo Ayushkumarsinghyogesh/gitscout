@@ -32,6 +32,40 @@ That's it. This is 90% of all usage.
 
 ---
 
+## Running it for DefenderMate (the daily job)
+
+The production run crawls the repositories in the `cloud-security` profile, collects
+full issue / PR / discussion threads, finds emails and LinkedIn links, pushes everything
+to the DefenderMate Supabase project and refreshes the outreach dataset
+`"Defendermate2".final_outreach_users`. One command, safe to run any time (incremental,
+idempotent, locked against overlapping runs):
+
+```bash
+gitscout scout -t cloud-security --incremental --with-threads --with-social --push
+```
+
+Setup, once per machine, on top of the setup above:
+
+```bash
+python set-supabase-dsn.py      # asks for the gitscout_writer password, writes SUPABASE_DB_URL into .env
+gitscout doctor                 # token, database, Supabase reachable
+gitscout scout -t cloud-security --with-threads --with-social --push   # first run: full backfill (~30 min for trivy)
+```
+
+Then schedule the incremental command, whichever fits the machine:
+
+| Where | How |
+|---|---|
+| Windows | `powershell -ExecutionPolicy Bypass -File scripts\install-schedule.ps1` registers the task `gitscout-scheduled-sync` (09:07 and 21:07, hidden window, missed runs catch up) |
+| Linux / macOS cron | `7 9,21 * * * cd /path/to/gitscout && .venv/bin/gitscout scout -t cloud-security --incremental --with-threads --with-social --push >> logs/sync.log 2>&1` |
+| Docker | `docker compose up -d` runs `gitscout watch`, the built-in scheduler, with `.env` mounted |
+
+How the pipeline works, what it costs, and what makes it safe to run at any time:
+[docs/ingestion-and-scheduling.md](docs/ingestion-and-scheduling.md). What the outreach
+team reads and what every column means: [docs/outreach-data-model.md](docs/outreach-data-model.md).
+
+---
+
 ## The mental model
 
 Everything is one pipeline of four stages:
