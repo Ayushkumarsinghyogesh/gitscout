@@ -58,7 +58,7 @@ Then schedule the incremental command, whichever fits the machine:
 |---|---|
 | Windows | `powershell -ExecutionPolicy Bypass -File scripts\install-schedule.ps1` registers the task `gitscout-scheduled-sync` (09:07 and 21:07, hidden window, missed runs catch up) |
 | Linux / macOS cron | `7 9,21 * * * cd /path/to/gitscout && .venv/bin/gitscout scout -t cloud-security --incremental --with-threads --with-social --push >> logs/sync.log 2>&1` |
-| Docker | `docker compose up -d` runs `gitscout watch`, the built-in scheduler, with `.env` mounted |
+| Docker | `docker compose up -d` runs only the CSV-export loop (`gitscout watch`), **not** the Supabase push. On a server, prefer the cron line above. To run the daily job inside the container instead, put this in cron: `docker compose run --rm gitscout gitscout scout -t cloud-security --incremental --with-threads --with-social --push` |
 
 How the pipeline works, what it costs, and what makes it safe to run at any time:
 [docs/ingestion-and-scheduling.md](docs/ingestion-and-scheduling.md). What the outreach
