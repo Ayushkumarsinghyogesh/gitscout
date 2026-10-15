@@ -10,10 +10,26 @@ Proprietary software. See [LICENSE](LICENSE).
 ## Setup (once)
 
 ```bash
-python -m venv .venv && source .venv/bin/activate   # Windows: .venv\Scripts\activate
-pip install -e ".[dev]"
-echo 'GITHUB_TOKENS=ghp_xxx' > .env                 # needs the read:user scope
-gitscout doctor                                      # verifies token, DB, live queries
+# 1. Install (once)
+sudo apt install -y git python3-venv
+git clone https://github.com/Defendermate/gtm-eng.git
+cd gtm-eng/gitscout
+python3 -m venv .venv && source .venv/bin/activate
+pip install -e .
+mkdir -p logs
+
+# 2. Credentials (once; .env is git-ignored and stays on this machine)
+echo 'GITHUB_TOKENS=ghp_your_token_here' > .env
+python set-supabase-dsn.py          # prompts for the gitscout_writer password, writes SUPABASE_DB_URL
+
+# 3. Health check
+gitscout doctor                     # token, database and Supabase must all show OK
+
+# 4. First run: at most 2000 records per repository per section, at most 2000 people enriched
+gitscout scout -t trivy --max 2000 --limit 2000 --with-threads --with-social --push
+
+# 5. Daily, automatic (09:07 and 21:07 server time). Paste this line into `crontab -e`:
+7 9,21 * * * cd /home/USER/gtm-eng/gitscout && .venv/bin/gitscout scout -t cloud-security --incremental --max 2000 --limit 2000 --with-threads --with-social --push >> logs/sync.log 2>&1                                     # verifies token, DB, live queries
 ```
 
 A token is **mandatory** — GitHub returns `401` without one.
@@ -34,35 +50,88 @@ That's it. This is 90% of all usage.
 
 ## Running it for DefenderMate (the daily job)
 
-The production run crawls the repositories in the `cloud-security` profile, collects
-full issue / PR / discussion threads, finds emails and LinkedIn links, pushes everything
-to the DefenderMate Supabase project and refreshes the outreach dataset
-`"Defendermate2".final_outreach_users`. One command, safe to run any time (incremental,
-idempotent, locked against overlapping runs):
+The production run crawls the repositories in the `cloud-security` profile (issues, pull
+requests, discussions, forks, commits), collects the full threads, finds public emails
+and LinkedIn links, pushes everything to the DefenderMate Supabase project and refreshes
+the outreach dataset `"Defendermate2".final_outreach_users`.
+
+You need two things before you start: a GitHub personal access token with the
+`read:user` scope (<https://github.com/settings/tokens>) and the `gitscout_writer`
+database password (ask the maintainer).
+
+### Linux server, from zero
 
 ```bash
-gitscout scout -t cloud-security --incremental --with-threads --with-social --push
+# 1. Install (once)
+sudo apt install -y git python3-venv
+git clone https://github.com/Defendermate/gtm-eng.git
+cd gtm-eng/gitscout
+python3 -m venv .venv && source .venv/bin/activate
+pip install -e .
+mkdir -p logs
+
+# 2. Credentials (once; .env is git-ignored and never leaves this machine)
+echo 'GITHUB_TOKENS=ghp_your_token_here' > .env
+python set-supabase-dsn.py          # asks for the gitscout_writer password, writes SUPABASE_DB_URL
+
+# 3. Health check: token, database and Supabase must all show OK
+gitscout doctor
+
+# 4. First run: at most 2000 records per repository per section, at most 2000 people enriched
+gitscout scout -t cloud-security --max 2000 --limit 2000 --with-threads --with-social --push
 ```
 
-Setup, once per machine, on top of the setup above:
+Then make it run by itself, twice a day (09:07 and 21:07 server time). Open the schedule
+with `crontab -e` and paste this one line, with `/home/USER` replaced by the real path:
 
-```bash
-python set-supabase-dsn.py      # asks for the gitscout_writer password, writes SUPABASE_DB_URL into .env
-gitscout doctor                 # token, database, Supabase reachable
-gitscout scout -t cloud-security --with-threads --with-social --push   # first run: full backfill (~30 min for trivy)
+```
+7 9,21 * * * cd /home/USER/gtm-eng/gitscout && .venv/bin/gitscout scout -t cloud-security --incremental --max 2000 --limit 2000 --with-threads --with-social --push >> logs/sync.log 2>&1
 ```
 
-Then schedule the incremental command, whichever fits the machine:
+`crontab -l` shows it is registered; `tail -f logs/sync.log` shows a run. No manual
+trigger is needed after this.
 
-| Where | How |
-|---|---|
-| Windows | `powershell -ExecutionPolicy Bypass -File scripts\install-schedule.ps1` registers the task `gitscout-scheduled-sync` (09:07 and 21:07, hidden window, missed runs catch up) |
-| Linux / macOS cron | `7 9,21 * * * cd /path/to/gitscout && .venv/bin/gitscout scout -t cloud-security --incremental --with-threads --with-social --push >> logs/sync.log 2>&1` |
-| Docker | `docker compose up -d` runs only the CSV-export loop (`gitscout watch`), **not** the Supabase push. On a server, prefer the cron line above. To run the daily job inside the container instead, put this in cron: `docker compose run --rm gitscout gitscout scout -t cloud-security --incremental --with-threads --with-social --push` |
+Standalone copy instead of the monorepo: `git clone https://github.com/Ayush-appagentix/gitscout.git && cd gitscout`.
 
-How the pipeline works, what it costs, and what makes it safe to run at any time:
-[docs/ingestion-and-scheduling.md](docs/ingestion-and-scheduling.md). What the outreach
-team reads and what every column means: [docs/outreach-data-model.md](docs/outreach-data-model.md).
+### Windows
+
+Same steps 1 to 4 in PowerShell (`.venv\Scripts\activate` instead of `source`), then
+register the scheduled task, which runs at 09:07 and 21:07 with a hidden window and
+catches up on runs missed while the PC was off:
+
+```powershell
+powershell -ExecutionPolicy Bypass -File scripts\install-schedule.ps1
+Get-ScheduledTaskInfo -TaskName gitscout-scheduled-sync | fl LastRunTime, LastTaskResult, NextRunTime
+```
+
+The task runs only while the user who registered it is logged in (a locked screen is fine).
+
+### Docker
+
+`docker compose up -d` runs only the CSV-export loop (`gitscout watch`), **not** the
+Supabase push. To run the daily job inside the container, put this in cron instead of
+the line above:
+
+```
+7 9,21 * * * cd /home/USER/gtm-eng/gitscout && docker compose run --rm gitscout gitscout scout -t cloud-security --incremental --max 2000 --limit 2000 --with-threads --with-social --push >> logs/sync.log 2>&1
+```
+
+### What to expect
+
+- **Incremental and resumable.** Cursors are saved after every page. A run that stops,
+  or hits the 2000 cap, is continued by the next one; over a few runs everything is
+  covered. `--max` is per repository per section, `--limit` is people enriched per run.
+- **Idempotent and locked.** Running it twice changes nothing; two runs never overlap.
+- **Cost.** A full backfill of trivy is about 1,600 GitHub API points of the 5,000 per
+  hour a token gets; the daily incremental run is a few dozen. If the budget runs out
+  mid-run the client waits for the reset and continues.
+- **Time.** First run on trivy with the 2000 caps: 10 to 20 minutes. Daily run: 1 to 5
+  minutes, plus about 20 seconds to refresh the dataset.
+
+Useful afterwards: `gitscout stats` (people and emails found), `gitscout rate-limit`
+(GitHub quota left), `gitscout doctor` whenever something fails. Pipeline details and
+costs: [docs/ingestion-and-scheduling.md](docs/ingestion-and-scheduling.md). The dataset
+and every column: [docs/outreach-data-model.md](docs/outreach-data-model.md).
 
 ---
 
