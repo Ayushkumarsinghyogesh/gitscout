@@ -1,0 +1,17 @@
+{% extends "base.html" %}
+{% block title %}Runs{% endblock %}
+{% block content %}
+<h1>Runs</h1>
+<form method="get" action="/jobs" class="filters">
+  <select name="repo">
+    <option value="">All my repositories</option>
+    {% for x in v.repos %}<option value="{{ x }}" {{ "selected" if x == repo }}>{{ x }}</option>{% endfor %}
+  </select>
+  <select name="status">
+    <option value="">Any status</option>
+    {% for s in ["queued", "running", "succeeded", "failed", "cancelled"] %}<option {{ "selected" if s == status }}>{{ s }}</option>{% endfor %}
+  </select>
+  <button>Filter</button>
+</form>
+{% if jobs %}{% include "_jobs_table.html" %}{% else %}<p class="muted">No runs.</p>{% endif %}
+{% endblock %}

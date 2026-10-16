@@ -1,0 +1,11 @@
+{% extends "base.html" %}
+{% block title %}Forgot password{% endblock %}
+{% block solo %}
+<h1>Forgot your password?</h1>
+<p>We will email a link to choose a new one.</p>
+<form method="post" action="/auth/forgot" class="stack">
+  <label>Email <input type="email" name="email" required autofocus></label>
+  <button class="primary">Send the link</button>
+</form>
+<p class="small"><a href="/login">Back to sign in</a></p>
+{% endblock %}

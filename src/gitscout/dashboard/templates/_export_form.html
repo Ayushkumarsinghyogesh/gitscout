@@ -1,0 +1,24 @@
+<form method="get" action="/exports/download" class="stack">
+  {% if repo is defined and repo %}<input type="hidden" name="repo" value="{{ repo }}">
+  {% else %}
+  <label>Repository
+    <select name="repo">
+      <option value="">All my repositories</option>
+      {% for x in v.repos %}<option value="{{ x }}">{{ x }}</option>{% endfor %}
+    </select>
+  </label>
+  {% endif %}
+  <div class="row">
+    <label>From <input type="date" name="date_from" max="{{ today }}"></label>
+    <label>To <input type="date" name="date_to" max="{{ today }}"></label>
+  </div>
+  <p class="muted small">Leave both dates empty to export every record collected to date. Days are in IST and both ends are included.</p>
+  <label>Dates mean
+    <select name="basis">
+      <option value="collected">when GitScout collected the person</option>
+      <option value="activity">when the person was active on GitHub</option>
+    </select>
+  </label>
+  <label class="check"><input type="checkbox" name="full" value="1"> Keep very long text whole (cells over 32,000 characters do not open in Excel)</label>
+  <button class="primary">Download CSV</button>
+</form>

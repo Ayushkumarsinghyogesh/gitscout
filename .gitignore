@@ -17,3 +17,6 @@ logs/
 
 # Handover and access notes: private discussion, never published
 private/
+build/
+uv.lock
+invite-link.txt

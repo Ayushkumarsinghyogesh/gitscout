@@ -7,6 +7,7 @@ What the outreach team reads, where it comes from, and what each number means.
 | Object | What it is |
 |---|---|
 | `"Defendermate2"."Defendermate-Github1-Trivy-Final"` | **Start here.** One row per person active in `aquasecurity/trivy`. |
+| `"Defendermate2".final_outreach_users_trivy` | The same rows under the original name; both names work. |
 | `"Defendermate2".final_outreach_users` | The same, for every registered repository. One row per (repository, person). |
 | `gitscout.issue_detail` / `discussion_detail` / `pr_detail` | Full threads: complete description, every comment, each commenter's email. |
 | `gitscout.people`, `person_emails`, `repositories` | Shared mirror tables: a person active in two repositories is one row. |

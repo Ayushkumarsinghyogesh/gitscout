@@ -1,0 +1,48 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<meta name="robots" content="noindex">
+<title>{% block title %}GitScout{% endblock %} · GitScout</title>
+<link rel="stylesheet" href="/static/app.css">
+</head>
+<body>
+{% if v is defined and v %}
+<div class="shell">
+  <aside class="side">
+    <a class="brand" href="/"><span class="mark">G</span> GitScout</a>
+    <nav>
+      {% set here = request.url.path %}
+      <a href="/" class="{{ 'on' if here == '/' }}">Overview</a>
+      <a href="/repos" class="{{ 'on' if here.startswith('/repos') }}">Repositories</a>
+      <a href="/records" class="{{ 'on' if here.startswith('/records') }}">Records</a>
+      <a href="/exports" class="{{ 'on' if here.startswith('/exports') }}">Export CSV</a>
+      <a href="/jobs" class="{{ 'on' if here.startswith('/jobs') }}">Runs</a>
+      {% if v.can_manage_users %}<a href="/users" class="{{ 'on' if here.startswith('/users') }}">Users</a>{% endif %}
+    </nav>
+    <div class="me">
+      <div class="who">{{ v.email }}</div>
+      <div class="role">{{ v.role_label }}</div>
+      <a href="/account/password">Change password</a>
+      <form method="post" action="/logout"><button class="link">Sign out</button></form>
+    </div>
+  </aside>
+  <main class="main">
+    {% if ok %}<div class="flash ok">{{ ok }}</div>{% endif %}
+    {% if err %}<div class="flash err">{{ err }}</div>{% endif %}
+    {% block content %}{% endblock %}
+  </main>
+</div>
+{% else %}
+<main class="solo">
+  <div class="card narrow">
+    <div class="brand big"><span class="mark">G</span> GitScout</div>
+    {% if ok %}<div class="flash ok">{{ ok }}</div>{% endif %}
+    {% if err %}<div class="flash err">{{ err }}</div>{% endif %}
+    {% block solo %}{% endblock %}
+  </div>
+</main>
+{% endif %}
+</body>
+</html>

@@ -24,6 +24,11 @@ dev = ["pytest>=8"]
 # Only needed for `gitscout supabase push` against a project whose Data API
 # is not exposed. The REST path needs nothing extra.
 postgres = ["psycopg[binary]>=3.1"]
+# The always-on worker: Postgres for the queue, cryptography to sign GitHub App JWTs.
+worker = ["psycopg[binary]>=3.1", "cryptography>=42"]
+# The dashboard: FastAPI + server-rendered templates, Supabase Auth, the same Postgres.
+web = ["psycopg[binary]>=3.1", "psycopg-pool>=3.2", "fastapi>=0.110", "uvicorn[standard]>=0.29",
+       "jinja2>=3.1", "python-multipart>=0.0.9", "itsdangerous>=2.1"]
 
 [project.scripts]
 gitscout = "gitscout.cli:app"
@@ -32,7 +37,7 @@ gitscout = "gitscout.cli:app"
 where = ["src"]
 
 [tool.setuptools.package-data]
-gitscout = ["profiles/*.toml", "*.sql"]
+gitscout = ["profiles/*.toml", "*.sql", "dashboard/templates/*.html", "dashboard/static/*"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]

@@ -1,0 +1,43 @@
+{% extends "base.html" %}
+{% block title %}{{ p.username }}{% endblock %}
+{% block content %}
+<p><a href="/records?repo={{ repo }}">← {{ repo }} records</a></p>
+<div class="head">
+  <h1>{{ p.full_name or p.username }} <span class="muted">@{{ p.username }}</span></h1>
+  <a class="button" href="{{ p.profile_url }}" rel="noopener noreferrer" target="_blank">GitHub profile</a>
+</div>
+<div class="cols">
+  <div class="card">
+    <h3>Contact</h3>
+    <p>Email: {{ p.email or "not found" }}{% if p.email_source %} <span class="muted small">({{ p.email_source }})</span>{% endif %}</p>
+    <p>LinkedIn: {% if p.linkedin_url %}<a href="{{ p.linkedin_url }}" rel="noopener noreferrer" target="_blank">{{ p.linkedin_url }}</a>{% else %}not found{% endif %}</p>
+    <p>Company: {{ p.company_name or "-" }}{% if p.company_domain %} · {{ p.company_domain }}{% endif %}</p>
+    <p>Location: {{ p.location or "-" }}</p>
+    {% if p.bio %}<p class="muted">{{ p.bio }}</p>{% endif %}
+  </div>
+  <div class="card">
+    <h3>Involvement in {{ repo }}</h3>
+    <p>Issues: {{ p.issues_count|num }} ({{ p.issues_opened|num }} opened)</p>
+    <p>Pull requests: {{ p.pull_requests_count|num }} ({{ p.pull_requests_opened|num }} opened, {{ p.pull_requests_reviewed|num }} reviewed)</p>
+    <p>Discussions: {{ p.discussions_count|num }} ({{ p.discussions_answered|num }} answered)</p>
+    <p>Forks: {{ p.forks_count|num }}</p>
+    <p>Signals: {{ (p.engagement_signals or [])|join(", ") or "-" }}</p>
+    <p class="muted small">Active {{ p.first_seen_at|ist("%d %b %Y") }} to {{ p.last_seen_at|ist("%d %b %Y") }} · collected {{ p.first_collected_at|ist("%d %b %Y") }}</p>
+  </div>
+</div>
+{% for label, items in [("Issues", p.issue_details), ("Pull requests", p.pull_request_details), ("Discussions", p.discussion_details)] %}
+  {% if items %}
+  <h2>{{ label }}</h2>
+  {% for t in items[:25] %}
+  <div class="card thread">
+    <p><a href="{{ t.url }}" rel="noopener noreferrer" target="_blank">#{{ t.number }} {{ t.title }}</a>
+       <span class="muted small">{{ t.role }}, {{ t.own_comments }} of their own comments, {{ t.created_at|ist("%d %b %Y") }}</span></p>
+    {% for c in (t.comments or [])[:5] %}
+      <blockquote><span class="muted small">{{ c.type }} · {{ c.created_at|ist("%d %b %Y") }}</span><br>{{ (c.body or "")[:600] }}{{ "…" if (c.body or "")|length > 600 }}</blockquote>
+    {% endfor %}
+  </div>
+  {% endfor %}
+  {% if items|length > 25 %}<p class="muted">{{ items|length - 25 }} more in the CSV export.</p>{% endif %}
+  {% endif %}
+{% endfor %}
+{% endblock %}

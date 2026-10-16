@@ -1,0 +1,34 @@
+{% extends "base.html" %}
+{% block title %}Run #{{ j.id }}{% endblock %}
+{% block content %}
+<p><a href="/repos/{{ j.repo }}">← {{ j.repo }}</a></p>
+<div class="head">
+  <h1>Run #{{ j.id }} <span class="pill {{ {'succeeded':'good','failed':'bad','running':'run','queued':'warn'}.get(j.status, '') }}">{{ j.status }}</span></h1>
+  {% if can_manage and j.status in ("queued", "running") %}
+  <form method="post" action="/jobs/{{ j.id }}/cancel"><input type="hidden" name="csrf" value="{{ csrf }}"><button>Cancel</button></form>
+  {% endif %}
+</div>
+<div class="cols">
+  <div class="card">
+    <p>{{ j.kind }} run, started by {{ {"schedule": "the nightly schedule", "manual": "a person", "retry": "an automatic retry", "system": "the system"}[j.trigger] }}{% if j.parent_job_id %} (retry of <a href="/jobs/{{ j.parent_job_id }}">#{{ j.parent_job_id }}</a>){% endif %}</p>
+    <p>Attempt {{ j.attempt }} of {{ j.max_attempts }}</p>
+    <p>Queued {{ j.created_at|ist }}</p>
+    <p>Started {{ j.started_at|ist }} · finished {{ j.finished_at|ist }}</p>
+    <p>Last heartbeat {{ j.heartbeat_at|ago }}</p>
+    {% if j.rate.points_used is defined %}<p>GitHub points used: {{ j.rate.points_used|num }} ({{ j.rate.remaining|num }} left)</p>{% endif %}
+    {% if j.error %}<div class="flash err">{{ j.error }}</div>{% endif %}
+  </div>
+  <div class="card">
+    <h3>What it collected</h3>
+    {% set c = j.counters %}
+    {% if c.interactions %}<p>New interactions: {{ c.interactions.discovered|num }}</p>{% endif %}
+    {% if c.people %}<p>New people: {{ c.people.new|num }}</p>{% endif %}
+    {% if c.emails %}<p>New emails: {{ c.emails.new|num }}</p>{% endif %}
+    {% if c.social %}<p>LinkedIn found: {{ c.social.linkedin|num }}</p>{% endif %}
+    {% if c.threads %}<p>Threads fetched: {{ c.threads.fetched|num }}, comments {{ c.threads.comments|num }}</p>{% endif %}
+    {% if c.push %}<p>Rows saved to the database: {{ c.push.rows|num }}</p>{% endif %}
+    {% if c.export %}<p>Exported {{ c.export.rows|num }} rows</p>{% endif %}
+    {% if not c %}<p class="muted">Nothing yet.</p>{% endif %}
+  </div>
+</div>
+{% endblock %}

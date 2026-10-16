@@ -150,3 +150,32 @@ def _isolate_environment(monkeypatch):
     monkeypatch.setattr("gitscout.config.load_dotenv", lambda *a, **kw: False)
     for name in _LEAKY_ENV:
         monkeypatch.delenv(name, raising=False)
+
+
+# ------------------------------------------------- a real Postgres, once per session
+#
+# The queue (gitscout.jobs) and the mirror use Postgres features SQLite lacks (SKIP
+# LOCKED, partial unique indexes, RLS). `pgserver` boots a throwaway cluster without
+# Docker or root; the canonical schema is applied to it exactly as to Supabase.
+
+
+@pytest.fixture(scope="session")
+def pg_dsn(tmp_path_factory):
+    pgserver = pytest.importorskip("pgserver")
+    import psycopg
+    from pathlib import Path
+
+    root = Path(__file__).resolve().parents[1]
+    server = pgserver.get_server(str(tmp_path_factory.mktemp("pg")))
+    dsn = server.get_uri()
+    schema = (root / "src" / "gitscout" / "supabase_schema.sql").read_text(encoding="utf-8")
+    with psycopg.connect(dsn, autocommit=True) as conn:
+        conn.execute("create role anon nologin; create role authenticated nologin")
+        conn.execute(schema)
+        conn.execute(
+            "insert into gitscout.repositories (repo, repository_id, owner, name, url) values "
+            "('o/r', 1, 'o', 'r', 'https://github.com/o/r'), ('o/s', 2, 'o', 's', 'https://github.com/o/s')"
+        )
+    yield dsn
+    server.cleanup()
+

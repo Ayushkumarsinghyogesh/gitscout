@@ -1,0 +1,85 @@
+# Render Blueprint: the whole GitScout system on Render, in the project
+# "defendermate-github-scraper".
+#
+#   gitscout-worker  background worker, always on: the nightly 00:00 IST runs, "Run now"
+#                    clicks, retries, the weekly deletion sweep, the 02:00 IST archive
+#                    export, alerts. Keeps its local working copy on a 2 GB disk.
+#   gitscout-web     the dashboard: login, repositories, records, CSV export, runs, users.
+#
+# Secrets are `sync: false`: Render asks for them when the Blueprint is applied and
+# they are never in this file or in Git. The data lives in Supabase, not on Render.
+#
+# In the gtm-eng repository this file is gitscout/render.yaml: give that path as the
+# Blueprint file and keep rootDir as below.
+
+services:
+  - type: worker
+    name: gitscout-worker
+    runtime: python
+    plan: starter
+    region: oregon
+    rootDir: gitscout
+    buildCommand: pip install ".[worker]"
+    startCommand: gitscout worker run
+    autoDeploy: false
+    disk:
+      name: gitscout-data
+      mountPath: /var/data
+      sizeGB: 2
+    envVars:
+      - key: PYTHON_VERSION
+        value: "3.12.7"
+      - key: GITSCOUT_DB
+        value: /var/data/gitscout.db
+      - key: GITSCOUT_LOG_FORMAT
+        value: json
+      - key: GITSCOUT_ALERT_FROM
+        value: "GitScout <onboarding@resend.dev>"
+      - key: SUPABASE_URL
+        sync: false
+      - key: SUPABASE_SERVICE_KEY          # Storage uploads for the nightly archive
+        sync: false
+      - key: SUPABASE_DB_URL               # the gitscout_writer role
+        sync: false
+      - key: GITHUB_TOKENS                 # until the GitHub App exists
+        sync: false
+      - key: GITHUB_APP_ID
+        sync: false
+      - key: GITHUB_APP_INSTALLATION_ID
+        sync: false
+      - key: GITHUB_APP_PRIVATE_KEY
+        sync: false
+      - key: RESEND_API_KEY
+        sync: false
+
+  - type: web
+    name: gitscout-web
+    runtime: python
+    plan: starter
+    region: oregon
+    rootDir: gitscout
+    buildCommand: pip install ".[web]"
+    startCommand: gitscout web
+    healthCheckPath: /healthz
+    autoDeploy: false
+    envVars:
+      - key: PYTHON_VERSION
+        value: "3.12.7"
+      - key: GITSCOUT_LOG_FORMAT
+        value: json
+      - key: GITSCOUT_ALERT_FROM
+        value: "GitScout <onboarding@resend.dev>"
+      - key: GITSCOUT_SESSION_SECRET
+        generateValue: true
+      - key: GITSCOUT_PUBLIC_URL            # e.g. https://gitscout-web.onrender.com
+        sync: false
+      - key: SUPABASE_URL
+        sync: false
+      - key: SUPABASE_SERVICE_KEY          # Auth (invitations, sign-in) and Storage links
+        sync: false
+      - key: GITSCOUT_APP_DB_URL           # the gitscout_app role (least privilege)
+        sync: false
+      - key: GITHUB_TOKENS                 # checks a repository exists before adding it
+        sync: false
+      - key: RESEND_API_KEY
+        sync: false

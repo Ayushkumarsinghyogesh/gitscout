@@ -955,3 +955,33 @@ query RepliesFill($id: ID!, $first: Int!, $after: String) {
 }
 """
 )
+
+# ------------------------------------------------------- deletion sweep (numbers only)
+#
+# Everything the sweep needs is the set of numbers that still exist. One point buys a
+# hundred of them, so a full pass over trivy (11,000 threads) costs about 110 points.
+# CREATED_AT ascending: stable under a cursor while new threads are being opened.
+
+def _numbers_query(op: str, connection: str, args: str) -> str:
+    return (
+        f"query {op}($owner: String!, $name: String!, $first: Int!, $after: String) {{\n"
+        + _RATE_LIMIT
+        + f"""
+  repository(owner: $owner, name: $name) {{
+    {connection}(first: $first, after: $after{args}, orderBy: {{field: CREATED_AT, direction: ASC}}) {{
+      totalCount
+      pageInfo {{ hasNextPage endCursor }}
+      nodes {{ number }}
+    }}
+  }}
+}}
+"""
+    )
+
+
+#: kind -> (query, connection path): the input of a deletion sweep.
+THREAD_NUMBERS: dict[str, tuple[str, tuple[str, ...]]] = {
+    "issues": (_numbers_query("IssueNumbers", "issues", ", states: [OPEN, CLOSED]"), ("repository", "issues")),
+    "prs": (_numbers_query("PullRequestNumbers", "pullRequests", ", states: [OPEN, CLOSED, MERGED]"), ("repository", "pullRequests")),
+    "discussions": (_numbers_query("DiscussionNumbers", "discussions", ""), ("repository", "discussions")),
+}

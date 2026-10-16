@@ -1,0 +1,50 @@
+{% extends "base.html" %}
+{% block title %}Users{% endblock %}
+{% block content %}
+<h1>Users</h1>
+<div class="card" id="invite">
+  <h2>Invite someone</h2>
+  <form method="post" action="/users/invite" class="stack">
+    <input type="hidden" name="csrf" value="{{ csrf }}">
+    <label>Email <input type="email" name="email" required></label>
+    <label>Role
+      <select name="role">
+        <option value="client_viewer">Client: sees and exports their repositories, can add repositories</option>
+        {% if v.is_super %}
+        <option value="client_admin">Admin client: also pauses runs and invites clients</option>
+        <option value="platform_admin">Super admin: everything</option>
+        {% endif %}
+      </select>
+    </label>
+    <fieldset><legend>Repositories they can see</legend>
+      {% for x in v.admin_repos %}<label class="check"><input type="checkbox" name="repos" value="{{ x }}"> {{ x }}</label>{% endfor %}
+    </fieldset>
+    <button class="primary">Send invitation</button>
+  </form>
+</div>
+
+<table class="grid">
+  <thead><tr><th>Email</th><th>Role</th><th>Repositories</th><th>Since</th><th></th></tr></thead>
+  <tbody>
+  {% for u in users %}
+  <tr>
+    <td>{{ u.email }}{% if u.disabled_at %} <span class="pill bad">disabled</span>{% endif %}</td>
+    <td>{{ roles[u.role] }}</td>
+    <td>{% if u.role == "platform_admin" %}all{% else %}
+      {% for repo in u.repos %}
+        <form method="post" action="/users/{{ u.user_id }}/revoke" class="inline">
+          <input type="hidden" name="csrf" value="{{ csrf }}"><input type="hidden" name="repo" value="{{ repo }}">
+          {{ repo }}{% if v.can_manage(repo) and u.user_id != v.user_id %} <button class="link" title="Remove access">×</button>{% endif %}
+        </form>
+      {% else %}-{% endfor %}{% endif %}</td>
+    <td>{{ u.created_at|ist("%d %b %Y") }}</td>
+    <td>{% if v.is_super and u.user_id != v.user_id %}
+      <form method="post" action="/users/{{ u.user_id }}/disabled"><input type="hidden" name="csrf" value="{{ csrf }}">
+        <input type="hidden" name="disabled" value="{{ 0 if u.disabled_at else 1 }}">
+        <button>{{ "Enable" if u.disabled_at else "Disable" }}</button></form>
+    {% endif %}</td>
+  </tr>
+  {% endfor %}
+  </tbody>
+</table>
+{% endblock %}

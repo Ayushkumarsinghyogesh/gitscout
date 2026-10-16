@@ -1,0 +1,43 @@
+{% extends "base.html" %}
+{% block title %}Repositories{% endblock %}
+{% block content %}
+<h1>Repositories</h1>
+
+<div class="card" id="add">
+  <h2>Add repositories</h2>
+  <p class="muted">One per line: <code>owner/name</code> or a GitHub link. You can also upload a .txt or .csv file.
+     Each new repository is collected right away (up to 2,000 items per section per run). After that it
+     runs every night at 00:00 IST and picks up only what is new.</p>
+  <form method="post" action="/repos/add" enctype="multipart/form-data" class="stack">
+    <input type="hidden" name="csrf" value="{{ csrf }}">
+    <textarea name="repos" rows="4" placeholder="aquasecurity/trivy&#10;https://github.com/owner/name"></textarea>
+    <label class="file">Or upload a list <input type="file" name="file" accept=".txt,.csv,text/plain,text/csv"></label>
+    <button class="primary">Add and start collecting</button>
+  </form>
+</div>
+
+{% if repos %}
+<table class="grid">
+  <thead><tr><th>Repository</th><th class="r">People</th><th class="r">Emails</th><th class="r">LinkedIn</th><th>Last success</th><th>Status</th><th></th></tr></thead>
+  <tbody>
+  {% for r in repos %}
+  <tr>
+    <td><a href="/repos/{{ r.repo }}">{{ r.repo }}</a>{% if r.stars %} <span class="muted small">★ {{ r.stars|num }}</span>{% endif %}</td>
+    <td class="r">{{ r.records|num }}</td>
+    <td class="r">{{ r.with_email|num }}</td>
+    <td class="r">{{ r.with_linkedin|num }}</td>
+    <td>{{ r.last_success_at|ago }}</td>
+    <td>{% include "_status.html" %}</td>
+    <td class="actions">
+      <form method="post" action="/repos/{{ r.repo }}/run"><input type="hidden" name="csrf" value="{{ csrf }}">
+        <button {{ "disabled" if r.active_job_id }}>Run now</button></form>
+      <a class="button" href="/exports?repo={{ r.repo }}">Export</a>
+    </td>
+  </tr>
+  {% endfor %}
+  </tbody>
+</table>
+{% else %}
+<p class="muted">You have no repositories yet.</p>
+{% endif %}
+{% endblock %}

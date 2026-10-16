@@ -816,6 +816,434 @@ def social_cmd(
     typer.echo(f"looked up {looked} people, {found} LinkedIn links, {points} GraphQL points")
 
 
+# ----------------------------------------------------------------- jobs and repos
+#
+# The durable queue (gitscout.jobs) and repository configuration (gitscout.repositories)
+# live in Postgres; these commands are the operator's view of them. The worker and the
+# dashboard use the same JobStore, so what you see here is what they see.
+
+jobs_app = typer.Typer(help="The job queue: what is scheduled, running, done or failed.", no_args_is_help=True)
+repos_app = typer.Typer(help="Repository configuration: enable, schedule, collections.", no_args_is_help=True)
+app.add_typer(jobs_app, name="jobs")
+app.add_typer(repos_app, name="repos")
+
+
+def _job_store(ctx: typer.Context):
+    from .jobs import JobError, JobStore
+
+    settings = _settings(ctx)
+    if not settings.supabase_db_url:
+        raise typer.BadParameter("SUPABASE_DB_URL is not set; the queue lives in Postgres")
+    try:
+        return JobStore(settings.supabase_db_url, schema=settings.supabase_schema)
+    except JobError as exc:
+        raise typer.BadParameter(str(exc)) from exc
+
+
+def _when(value) -> str:
+    return value.strftime("%Y-%m-%d %H:%M:%SZ") if value else "-"
+
+
+@jobs_app.command("list")
+def jobs_list(
+    ctx: typer.Context,
+    repo: Annotated[Optional[str], typer.Option("--repo", help="Only this repository (owner/name)")] = None,
+    status: Annotated[Optional[str], typer.Option("--status", help="queued, running, succeeded, failed or cancelled")] = None,
+    limit: Annotated[int, typer.Option("--limit", help="Newest N jobs")] = 30,
+) -> None:
+    """Newest jobs first: id, repository, kind, trigger, status, attempt, timing, error."""
+    with _job_store(ctx) as store:
+        rows = store.list(repo=repo, status=status, limit=limit)
+    if not rows:
+        typer.echo("no jobs")
+        return
+    typer.echo(f"{'id':>6}  {'repo':28} {'kind':12} {'trigger':9} {'status':10} {'try':>3}  {'run_after':20} {'finished':20}  error")
+    for j in rows:
+        err = (j.error or "").splitlines()[0][:60] if j.error else ""
+        typer.echo(f"{j.id:>6}  {j.repo:28} {j.kind:12} {j.trigger:9} {j.status:10} {j.attempt:>2}/{j.max_attempts}  "
+                   f"{_when(j.run_after):20} {_when(j.finished_at):20}  {err}")
+
+
+@jobs_app.command("show")
+def jobs_show(ctx: typer.Context, job_id: Annotated[int, typer.Argument()]) -> None:
+    """Everything recorded about one job: timing, counters, GitHub points, checkpoint keys, error."""
+    import json
+
+    with _job_store(ctx) as store:
+        job = store.get(job_id)
+    if job is None:
+        typer.echo(f"job {job_id} does not exist")
+        raise typer.Exit(code=1)
+    seconds = (job.finished_at or job.heartbeat_at) - job.started_at if job.started_at and (job.finished_at or job.heartbeat_at) else None
+    typer.echo(f"job {job.id}: {job.kind} {job.repo} ({job.trigger}) -> {job.status}, attempt {job.attempt}/{job.max_attempts}")
+    typer.echo(f"  created {_when(job.created_at)}  started {_when(job.started_at)}  finished {_when(job.finished_at)}"
+               f"  took {int(seconds.total_seconds()) if seconds else '-'} s")
+    typer.echo(f"  worker {job.worker or '-'}  version {job.code_version or '-'}  heartbeat {_when(job.heartbeat_at)}")
+    if job.parent_job_id:
+        typer.echo(f"  retry of job {job.parent_job_id}")
+    typer.echo(f"  rate     {json.dumps(job.rate, default=str)}")
+    typer.echo(f"  counters {json.dumps(job.counters, indent=2, default=str)}")
+    typer.echo(f"  checkpoint: {len(job.checkpoint)} cursor(s)")
+    if job.error:
+        typer.echo(f"  error: {job.error}")
+
+
+@jobs_app.command("enqueue")
+def jobs_enqueue(
+    ctx: typer.Context,
+    repo: Annotated[str, typer.Argument(help="owner/name, must be registered")],
+    kind: Annotated[str, typer.Option("--kind", help="incremental (default), full, backfill, sweep")] = "incremental",
+    priority: Annotated[int, typer.Option("--priority", help="Lower runs first")] = 100,
+) -> None:
+    """Ask for a run. Refused (exit 3) when the same repository and kind is already queued or running."""
+    from .jobs import JobError
+
+    try:
+        with _job_store(ctx) as store:
+            job_id = store.enqueue(repo, kind, "manual", priority=priority)
+            if job_id is not None:
+                store.audit("job.enqueue", actor_email="cli", repo=repo, target_kind="job",
+                            target_id=str(job_id), details={"kind": kind})
+    except JobError as exc:
+        raise typer.BadParameter(str(exc)) from exc
+    if job_id is None:
+        typer.echo(f"{repo} already has a {kind} job queued or running; nothing added")
+        raise typer.Exit(code=3)
+    typer.echo(f"queued job {job_id}: {kind} for {repo}")
+
+
+@jobs_app.command("cancel")
+def jobs_cancel(ctx: typer.Context, job_id: Annotated[int, typer.Argument()]) -> None:
+    """Cancel a queued job, or ask a running one to stop at its next heartbeat."""
+    with _job_store(ctx) as store:
+        done = store.cancel(job_id)
+        if done:
+            store.audit("job.cancel", actor_email="cli", target_kind="job", target_id=str(job_id))
+    typer.echo(f"job {job_id} {'cancelled' if done else 'is not queued or running'}")
+    if not done:
+        raise typer.Exit(code=1)
+
+
+@jobs_app.command("requeue-stale")
+def jobs_requeue_stale(
+    ctx: typer.Context,
+    minutes: Annotated[int, typer.Option("--minutes", help="A running job silent this long is presumed dead")] = 10,
+) -> None:
+    """Fail running jobs whose worker stopped heart-beating and queue their retries."""
+    from datetime import timedelta
+
+    with _job_store(ctx) as store:
+        pairs = store.requeue_stale(timedelta(minutes=minutes))
+    for job_id, retry in pairs:
+        typer.echo(f"job {job_id} failed as stalled; retry {retry if retry else 'not scheduled (attempts exhausted)'}")
+    if not pairs:
+        typer.echo("no stalled jobs")
+
+
+@repos_app.command("list")
+def repos_list(ctx: typer.Context) -> None:
+    """Every registered repository with its schedule and last success."""
+    with _job_store(ctx) as store:
+        rows = store.repositories()
+    typer.echo(f"{'repo':30} {'on':3} {'schedule':14} {'timezone':16} {'last success':20}  collections")
+    for r in rows:
+        typer.echo(f"{r.repo:30} {'yes' if r.enabled else 'no':3} {r.schedule_cron:14} {r.timezone:16} "
+                   f"{_when(r.last_success_at):20}  {','.join(r.collections)}")
+
+
+@repos_app.command("set")
+def repos_set(
+    ctx: typer.Context,
+    repo: Annotated[str, typer.Argument(help="owner/name")],
+    enable: Annotated[Optional[bool], typer.Option("--enable/--disable", help="Schedule it or pause it")] = None,
+    schedule: Annotated[Optional[str], typer.Option("--schedule", help='5-field cron, e.g. "0 0 * * *"')] = None,
+    tz: Annotated[Optional[str], typer.Option("--tz", help="IANA zone the schedule is read in, e.g. Asia/Kolkata")] = None,
+    collections: Annotated[Optional[str], typer.Option("--collections", help="Comma list: issues,prs,discussions,forks,commits")] = None,
+    max_items: Annotated[Optional[int], typer.Option("--max", help="Cap per section per run (0 = none)")] = None,
+    limit: Annotated[Optional[int], typer.Option("--limit", help="People enriched per run (0 = all)")] = None,
+) -> None:
+    """Change how and when a repository is collected. Only the options given change."""
+    from .jobs import JobError
+
+    settings = None
+    if max_items is not None or limit is not None:
+        settings = {k: v for k, v in (("max", max_items), ("limit", limit)) if v is not None}
+    try:
+        with _job_store(ctx) as store:
+            found = store.set_repository(
+                repo, enabled=enable, schedule_cron=schedule, tz=tz,
+                collections=[c.strip() for c in collections.split(",")] if collections else None,
+                settings=settings,
+            )
+            if found:
+                store.audit("repo.configure", actor_email="cli", repo=repo, target_kind="repository",
+                            target_id=repo, details={"enable": enable, "schedule": schedule, "tz": tz,
+                                                     "collections": collections, "settings": settings})
+    except JobError as exc:
+        raise typer.BadParameter(str(exc)) from exc
+    if not found:
+        typer.echo(f"{repo} is not registered (run `gitscout repo-info {repo}` first)")
+        raise typer.Exit(code=1)
+    typer.echo(f"updated {repo}")
+
+
+@app.command("health")
+def health(ctx: typer.Context) -> None:
+    """Is the unattended system healthy? Workers, every repository, recent alerts.
+    Exit 1 when a repository is overdue or no worker was seen recently."""
+    with _job_store(ctx) as store:
+        workers, repos, alerts = store.workers(), store.health(), store.alerts(10)
+        silent_limit = int(float(store.settings().get("worker_silent_minutes") or 15) * 60)
+    problems = 0
+    typer.echo("workers:")
+    live = [w for w in workers if not w["stopped_at"]]
+    for w in workers:
+        state = "stopped" if w["stopped_at"] else ("SILENT" if w["silent_seconds"] > silent_limit else "alive")
+        typer.echo(f"  {w['name']:40} {state:8} seen {w['silent_seconds']:>6}s ago  version {w['version']}  "
+                   f"jobs {w['jobs_run']}  current {w['current_job_id'] or '-'}")
+    if not any(w["silent_seconds"] <= silent_limit for w in live):
+        problems += 1
+        typer.secho("  no worker seen in the last %d minutes" % (silent_limit // 60), fg=typer.colors.RED)
+    typer.echo("repositories:")
+    for r in repos:
+        flag = "OVERDUE" if r["overdue"] else ("ok" if r["enabled"] else "paused")
+        problems += bool(r["overdue"])
+        typer.echo(f"  {r['repo']:30} {flag:8} last success {_when(r['last_success_at'])} "
+                   f"({r['hours_since_success'] if r['hours_since_success'] is not None else '-'} h)  "
+                   f"failures in a row {r['consecutive_failures']}  last job {r['last_job_id'] or '-'} "
+                   f"{r['last_job_status'] or ''}  active {r['active_job_id'] or '-'}")
+    typer.echo("recent alerts:")
+    for a in alerts:
+        typer.echo(f"  {_when(a['at'])} {a['severity']:8} {a['subject']}  "
+                   f"({'emailed' if a['sent_at'] else 'not emailed: ' + (a['error'] or a['channel'])})")
+    if not alerts:
+        typer.echo("  none")
+    if problems:
+        raise typer.Exit(code=1)
+
+
+alerts_app = typer.Typer(help="Alert email: check the configuration end to end.", no_args_is_help=True)
+app.add_typer(alerts_app, name="alerts")
+
+
+@alerts_app.command("test")
+def alerts_test(ctx: typer.Context) -> None:
+    """Send a test alert to the configured recipients and record it in gitscout.alerts."""
+    from datetime import datetime, timezone
+
+    from .alerts import Alert, Alerter
+
+    settings = _settings(ctx)
+    alerter = Alerter(settings)
+    with _job_store(ctx) as store:
+        key = "test:" + datetime.now(timezone.utc).strftime("%Y%m%d%H%M%S")
+        ids = alerter.raise_all(store, [Alert(key, "info", "test alert",
+                                              "If you can read this, GitScout alert email works.")])
+        rows = store.alerts(1) if ids else []
+        to = alerter.recipients(store.settings())
+    if not rows:
+        typer.echo("could not record the alert (is migration 0013 applied?)")
+        raise typer.Exit(code=1)
+    row = rows[0]
+    if row["sent_at"]:
+        typer.echo(f"emailed to {len(to)} recipient(s)")
+    else:
+        typer.echo(f"recorded but not emailed: {row['error']}")
+        raise typer.Exit(code=2)
+
+
+dataset_app = typer.Typer(help="The outreach dataset: export it to CSV, list the nightly archives.", no_args_is_help=True)
+app.add_typer(dataset_app, name="dataset")
+
+
+@dataset_app.command("export")
+def dataset_export(
+    ctx: typer.Context,
+    repo: Annotated[Optional[str], typer.Option("--repo", help="owner/name; omit for every repository")] = None,
+    date_from: Annotated[Optional[str], typer.Option("--from", help="First day, YYYY-MM-DD (inclusive)")] = None,
+    date_to: Annotated[Optional[str], typer.Option("--to", help="Last day, YYYY-MM-DD (inclusive)")] = None,
+    basis: Annotated[str, typer.Option("--by", help="collected: when GitScout found them; activity: when they were active on GitHub")] = "collected",
+    tz: Annotated[str, typer.Option("--tz", help="Time zone the days are read in")] = "Asia/Kolkata",
+    full: Annotated[bool, typer.Option("--full", help="Keep every character (cells over 32,000 break Excel)")] = False,
+    out: Annotated[Optional[str], typer.Option("--out", "-o", help="File to write (default: a descriptive name here)")] = None,
+) -> None:
+    """Every record (or a date range) of the outreach dataset as CSV on this machine.
+    Same file the dashboard's Export button downloads."""
+    from .exports import ExportError, ExportRequest, parse_day, write_csv
+
+    settings = _settings(ctx)
+    if not settings.supabase_db_url:
+        raise typer.BadParameter("SUPABASE_DB_URL is not set")
+    try:
+        req = ExportRequest(repo=repo, date_from=parse_day(date_from), date_to=parse_day(date_to),
+                            basis=basis, tz=tz, excel_safe=not full)
+        req.bounds()
+    except ExportError as exc:
+        raise typer.BadParameter(str(exc)) from exc
+    path = out or req.filename()
+    rows, size = write_csv(settings.supabase_db_url, req, path, gzipped=path.endswith(".gz"))
+    typer.echo(f"wrote {rows} rows ({size / 1_048_576:.1f} MB) -> {path}")
+
+
+@dataset_app.command("archives")
+def dataset_archives(
+    ctx: typer.Context,
+    repo: Annotated[Optional[str], typer.Option("--repo")] = None,
+    limit: Annotated[int, typer.Option("--limit")] = 20,
+) -> None:
+    """The nightly exports kept in Storage (newest first)."""
+    from .exports import recent
+
+    with _job_store(ctx) as store:
+        rows = recent(store, repo, limit)
+    if not rows:
+        typer.echo("no archives")
+    for r in rows:
+        typer.echo(f"{r['id']:>5}  {_when(r['generated_at'])}  {r['row_count'] or 0:>7} rows  "
+                   f"{(r['byte_size'] or 0) / 1_048_576:6.1f} MB  expires {_when(r['expires_at'])}  {r['storage_path']}")
+
+
+@dataset_app.command("fetch")
+def dataset_fetch(
+    ctx: typer.Context,
+    export_id: Annotated[int, typer.Argument(help="id from `gitscout dataset archives`")],
+    out: Annotated[Optional[str], typer.Option("--out", "-o")] = None,
+) -> None:
+    """Download one nightly archive (.csv.gz) from Storage to this machine."""
+    import httpx
+
+    from .exports import ExportError, Storage
+
+    settings = _settings(ctx)
+    if not (settings.supabase_url and settings.supabase_key):
+        raise typer.BadParameter("SUPABASE_URL and SUPABASE_SERVICE_KEY are needed for Storage")
+    with _job_store(ctx) as store:
+        rows = store._rows(f"select storage_path from {store._t('exports')} where id = %s and deleted_at is null",
+                           [export_id])
+    if not rows:
+        typer.echo(f"archive {export_id} does not exist or has expired")
+        raise typer.Exit(code=1)
+    key = rows[0][0]
+    try:
+        url = Storage(settings.supabase_url, settings.supabase_key).signed_url(key, 600)
+    except ExportError as exc:
+        raise typer.BadParameter(str(exc)) from exc
+    path = out or key.rsplit("/", 1)[-1]
+    with httpx.stream("GET", url, timeout=600) as r, open(path, "wb") as fh:
+        r.raise_for_status()
+        for chunk in r.iter_bytes():
+            fh.write(chunk)
+    typer.echo(f"saved -> {path}")
+
+
+@app.command("web")
+def web(
+    host: Annotated[str, typer.Option("--host")] = "0.0.0.0",
+    port: Annotated[int, typer.Option("--port", envvar="PORT")] = 8000,
+) -> None:
+    """Serve the dashboard (login, repositories, records, exports, runs, users)."""
+    import uvicorn
+
+    uvicorn.run("gitscout.dashboard.app:app_from_env", factory=True, host=host, port=port,
+                proxy_headers=True, forwarded_allow_ips="*", access_log=False)
+
+
+admin_app = typer.Typer(help="Provision dashboard accounts (server side, by invitation only).", no_args_is_help=True)
+app.add_typer(admin_app, name="admin")
+
+
+@admin_app.command("invite")
+def admin_invite(
+    ctx: typer.Context,
+    email: Annotated[str, typer.Argument(help="The person's email")],
+    role: Annotated[str, typer.Option("--role", help="platform_admin (Super admin), client_admin or client_viewer")] = "client_viewer",
+    repo: Annotated[Optional[list[str]], typer.Option("--repo", help="Repository they may see (repeatable)")] = None,
+    link_file: Annotated[str, typer.Option("--link-file", help="Where to write the link when email is not configured")] = "invite-link.txt",
+) -> None:
+    """Invite someone through Supabase Auth and record their role. The one-time link is
+    emailed (RESEND_API_KEY) or written to --link-file (mode 600), never printed."""
+    import os
+    from urllib.parse import quote
+
+    from .dashboard import data
+    from .dashboard.auth import AuthError, SupabaseAuth
+    from .dashboard.mail import send
+
+    settings = _settings(ctx)
+    dsn = os.getenv("GITSCOUT_APP_DB_URL") or settings.supabase_db_url
+    public = (os.getenv("GITSCOUT_PUBLIC_URL") or "").rstrip("/")
+    if not (settings.supabase_url and settings.supabase_key and dsn and public):
+        raise typer.BadParameter("needs SUPABASE_URL, SUPABASE_SERVICE_KEY, GITSCOUT_APP_DB_URL and GITSCOUT_PUBLIC_URL")
+    if role not in data.ROLES:
+        raise typer.BadParameter(f"role must be one of {', '.join(data.ROLES)}")
+    email = email.strip().lower()
+    try:
+        user_id, token, kind = SupabaseAuth(settings.supabase_url, settings.supabase_key).generate_link("invite", email)
+    except AuthError as exc:
+        raise typer.BadParameter(f"Auth refused: {exc}") from exc
+    import psycopg
+
+    operator = data.Viewer(user_id="00000000-0000-0000-0000-000000000000", email="cli", role="platform_admin")
+    with psycopg.connect(dsn, prepare_threshold=None) as conn:
+        data.provision(conn, operator, user_id=user_id, email=email, role=role, repos=repo or [])
+    link = f"{public}/auth/confirm?token_hash={quote(token)}&type={kind}"
+    problem = send(settings, email, "You are invited to GitScout",
+                   f"You are invited to the GitScout dashboard as {data.ROLES[role]}.\n\n"
+                   f"Open this link to choose your password:\n\n{link}\n\nThe link works once.")
+    if problem is None:
+        typer.echo(f"invitation emailed to {email} ({data.ROLES[role]})")
+        return
+    fd = os.open(link_file, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+    with os.fdopen(fd, "w") as fh:
+        fh.write(link + "\n")
+    typer.echo(f"{email} provisioned as {data.ROLES[role]}; email not sent ({problem}).")
+    typer.echo(f"The one-time link is in {link_file}. Open it yourself or pass it to them privately, then delete the file.")
+
+
+worker_app = typer.Typer(help="The always-on worker: schedules, claims and runs jobs from the queue.", no_args_is_help=True)
+app.add_typer(worker_app, name="worker")
+
+
+@worker_app.command("run")
+def worker_run(
+    ctx: typer.Context,
+    once: Annotated[bool, typer.Option("--once", help="One tick (recover, schedule, run at most one job), then exit")] = False,
+    poll: Annotated[Optional[int], typer.Option("--poll", help="Seconds between empty ticks (default from GITSCOUT_WORKER_POLL, 60)")] = None,
+) -> None:
+    """Run forever: every minute recover stalled jobs, enqueue due schedules, run the
+    next job. This is the production process; nothing else needs to run.
+
+    Credentials: GITHUB_APP_ID + GITHUB_APP_INSTALLATION_ID + GITHUB_APP_PRIVATE_KEY
+    (tokens renew themselves) or GITHUB_TOKENS; and SUPABASE_DB_URL for the queue.
+    """
+    import asyncio
+    from dataclasses import replace
+
+    from .jobs import JobError
+    from .scheduler import install_signal_handlers
+    from .worker import Worker
+
+    settings = _settings(ctx)
+    if poll:
+        settings = replace(settings, worker_poll_seconds=max(10, poll))
+    try:
+        worker = Worker(settings)
+    except JobError as exc:
+        raise typer.BadParameter(str(exc)) from exc
+
+    async def main() -> None:
+        stop = asyncio.Event()
+        install_signal_handlers(stop)
+        await worker.serve(stop, once=once)
+
+    from .logs import configure
+
+    configure(settings.log_format)
+    asyncio.run(main())
+    if once:
+        typer.echo(f"tick done: {worker.jobs_run} job(s) run")
+
+
 supabase_app = typer.Typer(
     help="Mirror the local store into Supabase (Postgres) over PostgREST.",
     no_args_is_help=True,

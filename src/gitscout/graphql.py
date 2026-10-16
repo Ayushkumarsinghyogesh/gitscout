@@ -18,7 +18,7 @@ import logging
 import time
 from dataclasses import dataclass, field
 from datetime import datetime
-from typing import Any, AsyncIterator, Callable, Iterable, Mapping, Sequence
+from typing import Any, AsyncIterator, Awaitable, Callable, Iterable, Mapping, Sequence
 
 import httpx
 
@@ -27,6 +27,9 @@ from .github_client import GitHubAuthError, GitHubError, SleepFn, TokenPool
 log = logging.getLogger(__name__)
 
 DEFAULT_GRAPHQL_URL = "https://api.github.com/graphql"
+
+#: Returns fresh bearer tokens (an installation token renewed), or None to keep the current ones.
+TokenRefresh = Callable[[], Awaitable[Sequence[str] | None]]
 
 #: Error types meaning "the thing does not exist" rather than "the query failed".
 MISSING_TYPES = frozenset({"NOT_FOUND"})
@@ -153,11 +156,20 @@ class GraphQLClient:
         timeout: float = 60.0,
         sleep: SleepFn = asyncio.sleep,
         clock: Callable[[], float] = time.time,
+        token_refresh: TokenRefresh | None = None,
+        refresh_every: float = 50 * 60,
     ) -> None:
         self._url = url
         self._max_retries = max_retries
         self._sleep = sleep
         self._clock = clock
+        # A GitHub App installation token lives an hour. `token_refresh` returns fresh
+        # tokens; they are swapped in every `refresh_every` seconds and once more if a
+        # 401 arrives anyway (a token revoked early). Static PATs leave it None.
+        self._token_refresh = token_refresh
+        self._refresh_every = refresh_every
+        self._next_refresh = clock() + refresh_every if token_refresh else float("inf")
+        self._refreshed_after_401 = False
         self.pool = TokenPool(tokens, clock=clock, sleep=sleep)
         self.points_used = 0
         self.queries_sent = 0
@@ -173,6 +185,13 @@ class GraphQLClient:
 
     async def __aenter__(self) -> "GraphQLClient":
         return self
+
+    async def _renew_tokens(self) -> None:
+        assert self._token_refresh is not None
+        fresh = await self._token_refresh()
+        if fresh:
+            self.pool.replace(fresh)
+        self._next_refresh = self._clock() + self._refresh_every
 
     async def __aexit__(self, *exc: object) -> None:
         await self.aclose()
@@ -195,6 +214,8 @@ class GraphQLClient:
         payload = {"query": query, "variables": dict(variables or {})}
 
         while True:
+            if self._token_refresh is not None and self._clock() >= self._next_refresh:
+                await self._renew_tokens()
             state = await self.pool.acquire()
             headers = {"Authorization": f"Bearer {state.token}"} if state.token else {}
             try:
@@ -209,6 +230,10 @@ class GraphQLClient:
             self.pool.update(state, resp.headers)
 
             if resp.status_code == 401:
+                if self._token_refresh is not None and not self._refreshed_after_401:
+                    self._refreshed_after_401 = True
+                    await self._renew_tokens()
+                    continue
                 raise GitHubAuthError(f"Bad credentials for token {state.label}")
             if resp.status_code in (403, 429):
                 attempt += 1

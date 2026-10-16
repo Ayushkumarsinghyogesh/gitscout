@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import os
+from pathlib import Path
 from dataclasses import dataclass, field
 from urllib.parse import quote
 
@@ -49,6 +50,18 @@ class Settings:
 
     # --- scheduling
     schedule: str | None = None  # e.g. "6h"
+    # GitHub App (the production identity: tokens renew themselves, nothing expires)
+    github_app_id: str | None = None
+    github_app_installation_id: str | None = None
+    github_app_private_key: str | None = None  # PEM text
+    # The always-on worker
+    worker_poll_seconds: int = 60
+    worker_heartbeat_seconds: int = 30
+    # Alerts (Resend HTTP API); recipients come from app_settings.alert_emails first
+    resend_api_key: str | None = None
+    alert_from: str = "GitScout <alerts@notify.defendermate.com>"
+    alert_emails: tuple[str, ...] = ()
+    log_format: str = "text"  # text | json
     targets_file: str | None = None
 
     extra: dict[str, str] = field(default_factory=dict)
@@ -56,6 +69,10 @@ class Settings:
     @property
     def has_token(self) -> bool:
         return bool(self.tokens)
+
+    @property
+    def has_github_app(self) -> bool:
+        return bool(self.github_app_id and self.github_app_installation_id and self.github_app_private_key)
 
     @property
     def supabase_enabled(self) -> bool:
@@ -154,4 +171,28 @@ def load_settings(db_path: str | None = None) -> Settings:
         provider_budget=_int("GITSCOUT_PROVIDER_BUDGET", 0),
         schedule=_clean("GITSCOUT_SCHEDULE"),
         targets_file=_clean("GITSCOUT_TARGETS"),
+        github_app_id=_clean("GITHUB_APP_ID"),
+        github_app_installation_id=_clean("GITHUB_APP_INSTALLATION_ID"),
+        github_app_private_key=_private_key(),
+        worker_poll_seconds=max(10, _int("GITSCOUT_WORKER_POLL", 60)),
+        worker_heartbeat_seconds=max(5, _int("GITSCOUT_WORKER_HEARTBEAT", 30)),
+        resend_api_key=_clean("RESEND_API_KEY"),
+        alert_from=_clean("GITSCOUT_ALERT_FROM") or "GitScout <alerts@notify.defendermate.com>",
+        alert_emails=parse_tokens(_clean("GITSCOUT_ALERT_EMAILS")),
+        log_format="json" if (_clean("GITSCOUT_LOG_FORMAT") or "").lower() == "json" else "text",
     )
+
+
+def _private_key() -> str | None:
+    """The App's PEM, from GITHUB_APP_PRIVATE_KEY (newlines may be written as \\n, which
+    is how hosting dashboards store multi-line secrets) or from a file path."""
+    raw = _clean("GITHUB_APP_PRIVATE_KEY")
+    if raw:
+        return raw.replace("\\n", "\n")
+    path = _clean("GITHUB_APP_PRIVATE_KEY_PATH")
+    if path:
+        try:
+            return Path(path).read_text(encoding="utf-8")
+        except OSError:
+            return None
+    return None

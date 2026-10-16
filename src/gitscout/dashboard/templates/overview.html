@@ -1,0 +1,70 @@
+{% extends "base.html" %}
+{% block title %}Overview{% endblock %}
+{% block content %}
+<div class="head">
+  <h1>Overview</h1>
+  <a class="button primary" href="/repos#add">Add repositories</a>
+</div>
+
+<div class="stats">
+  <div class="stat"><div class="n">{{ totals.records|num }}</div><div class="l">people collected</div></div>
+  <div class="stat"><div class="n">{{ totals.with_email|num }}</div><div class="l">with an email</div></div>
+  <div class="stat"><div class="n">{{ totals.with_linkedin|num }}</div><div class="l">with LinkedIn</div></div>
+  <div class="stat"><div class="n">{{ totals.repos }}</div><div class="l">repositories</div></div>
+  <div class="stat {{ 'bad' if totals.failing }}"><div class="n">{{ totals.failing }}</div><div class="l">failing</div></div>
+</div>
+
+{% if not repos %}
+<div class="card empty">
+  <h2>No repositories yet</h2>
+  <p>Add a GitHub repository and GitScout collects the people who engage with it: issue and PR authors,
+     commenters, reviewers, discussion participants, forkers and committers. The first run starts right
+     away, and after that it runs every night at 00:00 IST.</p>
+  <a class="button primary" href="/repos#add">Add your first repository</a>
+</div>
+{% else %}
+<h2>Repositories</h2>
+<table class="grid">
+  <thead><tr><th>Repository</th><th class="r">People</th><th class="r">Emails</th><th>Last success</th><th>Status</th><th>Next run</th></tr></thead>
+  <tbody>
+  {% for r in repos %}
+  <tr>
+    <td><a href="/repos/{{ r.repo }}">{{ r.repo }}</a></td>
+    <td class="r">{{ r.records|num }}</td>
+    <td class="r">{{ r.with_email|num }}</td>
+    <td>{{ r.last_success_at|ago }}</td>
+    <td>{% include "_status.html" %}</td>
+    <td>{{ r.next_run|ist if r.next_run else "paused" }}</td>
+  </tr>
+  {% endfor %}
+  </tbody>
+</table>
+{% endif %}
+
+{% if jobs %}
+<h2>Recent runs</h2>
+{% include "_jobs_table.html" %}
+<p><a href="/jobs">All runs</a></p>
+{% endif %}
+
+{% if v.is_super %}
+<h2>System</h2>
+<div class="cols">
+  <div class="card">
+    <h3>Workers</h3>
+    {% for w in workers %}
+      <p><span class="pill {{ 'good' if not w.stopped_at and w.silent_seconds < 900 else 'bad' }}">
+        {{ "stopped" if w.stopped_at else ("alive" if w.silent_seconds < 900 else "silent") }}</span>
+        {{ w.name }}, seen {{ w.seen_at|ago }}, {{ w.jobs_run }} jobs, version {{ w.version }}</p>
+    {% else %}<p class="muted">No worker has reported yet.</p>{% endfor %}
+  </div>
+  <div class="card">
+    <h3>Recent alerts</h3>
+    {% for a in alerts %}
+      <p><span class="pill {{ 'bad' if a.severity == 'critical' else ('warn' if a.severity == 'warning' else 'good') }}">{{ a.severity }}</span>
+        {{ a.subject }} <span class="muted small">{{ a.at|ist }}</span></p>
+    {% else %}<p class="muted">None.</p>{% endfor %}
+  </div>
+</div>
+{% endif %}
+{% endblock %}

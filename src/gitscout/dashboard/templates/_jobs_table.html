@@ -1,0 +1,18 @@
+<table class="grid">
+  <thead><tr><th>Run</th><th>Repository</th><th>Kind</th><th>Started by</th><th>Status</th><th>Started</th><th class="r">Took</th><th class="r">New people</th><th class="r">New emails</th></tr></thead>
+  <tbody>
+  {% for j in jobs %}
+  <tr>
+    <td><a href="/jobs/{{ j.id }}">#{{ j.id }}</a></td>
+    <td>{{ j.repo }}</td>
+    <td>{{ j.kind }}</td>
+    <td>{{ {"schedule": "nightly", "manual": "a person", "retry": "retry", "system": "system"}[j.trigger] }}</td>
+    <td><span class="pill {{ {'succeeded':'good','failed':'bad','running':'run','queued':'warn'}.get(j.status, '') }}">{{ j.status }}</span></td>
+    <td>{{ j.started_at|ist if j.started_at else "-" }}</td>
+    <td class="r">{{ (j.seconds // 60)|string + " min" if j.seconds else "-" }}</td>
+    <td class="r">{{ j.people_new|num }}</td>
+    <td class="r">{{ j.emails_new|num }}</td>
+  </tr>
+  {% endfor %}
+  </tbody>
+</table>

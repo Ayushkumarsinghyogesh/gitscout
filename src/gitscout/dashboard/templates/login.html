@@ -1,0 +1,12 @@
+{% extends "base.html" %}
+{% block title %}Sign in{% endblock %}
+{% block solo %}
+<h1>Sign in</h1>
+<form method="post" action="/login" class="stack">
+  <input type="hidden" name="next" value="{{ next }}">
+  <label>Email <input type="email" name="email" required autocomplete="username" autofocus></label>
+  <label>Password <input type="password" name="password" required autocomplete="current-password"></label>
+  <button class="primary">Sign in</button>
+</form>
+<p class="muted small"><a href="/auth/forgot">Forgot your password?</a> · Accounts are by invitation only.</p>
+{% endblock %}

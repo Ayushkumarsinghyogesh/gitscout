@@ -367,6 +367,19 @@ class PostgresWriter:
                 self.statements += 1
         return len(rows)
 
+    def columns(self, schema: str, table: str) -> set[str] | None:
+        """The mirror table's columns, or None when they cannot be read."""
+        try:
+            with self._conn.cursor() as cur:
+                cur.execute(
+                    "select column_name from information_schema.columns "
+                    "where table_schema = %s and table_name = %s",
+                    [schema, table],
+                )
+                return {r[0] for r in cur.fetchall()}
+        except Exception:  # noqa: BLE001 - best effort; the insert itself is the check
+            return None
+
     def scalar(self, sql: str, params: Sequence[Any] = ()) -> Any:
         """Run one statement and return the first column of its first row."""
         with self._conn.cursor() as cur:
@@ -607,9 +620,23 @@ def _push_postgres(
             for r in store.sync_repositories()
         }
 
+        known: dict[str, set[str] | None] = {}
+
+        def fit(target_schema: str, table: str, rows: list[dict[str, Any]]) -> list[dict[str, Any]]:
+            # A local column the mirror does not have yet (a migration not applied)
+            # is left out instead of failing the whole push; it lands next time.
+            key = f"{target_schema}.{table}"
+            if key not in known:
+                cols = getattr(db, "columns", lambda *_: None)(target_schema, table)
+                known[key] = cols or None
+            cols = known[key]
+            if not cols:
+                return rows
+            return [{k: v for k, v in r.items() if k in cols} for r in rows]
+
         def write(name: str, table: str, conflict: str, rows: Sequence[Mapping[str, Any]]) -> None:
             if name not in REPO_SCOPED:
-                db.upsert(f"{schema}.{table}", _prepare(name, rows), on_conflict=conflict)
+                db.upsert(f"{schema}.{table}", fit(schema, table, _prepare(name, rows)), on_conflict=conflict)
                 return
             by_repo: dict[str, list[Mapping[str, Any]]] = {}
             for row in rows:
@@ -621,7 +648,7 @@ def _push_postgres(
                         f"{repo} has {name} rows but is not registered; run "
                         f"`gitscout repo-info {repo}` first"
                     )
-                db.upsert(f"{_quoted(target)}.{table}", _prepare(name, chunk), on_conflict=conflict)
+                db.upsert(f"{_quoted(target)}.{table}", fit(target, table, _prepare(name, chunk)), on_conflict=conflict)
 
         if streaming:
             readers = _readers(store)

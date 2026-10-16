@@ -440,7 +440,13 @@ class FakeWriter:
         FakeWriter.log.append(("commit" if exc_type is None else "rollback",))
         return False
 
+    columns_known: dict[str, set[str]] = {}   # "schema.table" -> columns, when a test sets it
+
+    def columns(self, schema, table):
+        return FakeWriter.columns_known.get(f"{schema}.{table}")
+
     def upsert(self, table, rows, *, on_conflict):
+        FakeWriter.log.append(("rows", table, [dict(r) for r in rows]))
         if FakeWriter.fail_on == "upsert" and table.endswith(".threads"):
             raise SupabaseError("threads: simulated failure")
         FakeWriter.log.append(("upsert", table, len(rows), on_conflict))
@@ -584,3 +590,21 @@ def test_rows_for_an_unregistered_repository_are_refused_not_misrouted(seeded, p
     with pytest.raises(SupabaseError, match="not registered"):
         run(push(pg, seeded, full=True))
     assert ("rollback",) in FakeWriter.log
+
+
+def test_push_sends_only_the_columns_the_mirror_has(seeded, pg):
+    """A worker newer than the mirror (a column added locally, its migration not yet
+    applied) must still push; the extra column is left out, not fatal."""
+    _register(seeded)
+    FakeWriter.columns_known = {"gitscout.people": {"login", "name", "best_email", "synced_at"}}
+    try:
+        run(push(pg, seeded, full=True))
+    finally:
+        FakeWriter.columns_known = {}
+    people_rows = [e for e in FakeWriter.log if e[0] == "rows" and e[1] == "gitscout.people"]
+    assert people_rows, "people were pushed"
+    sent = set().union(*(set(r.keys()) for r in people_rows[0][2]))
+    assert sent <= {"login", "name", "best_email", "synced_at"}
+    # a table whose columns are unknown is sent whole
+    thread_rows = [e for e in FakeWriter.log if e[0] == "rows" and e[1].endswith(".threads")]
+    assert thread_rows and len(thread_rows[0][2][0]) > 10

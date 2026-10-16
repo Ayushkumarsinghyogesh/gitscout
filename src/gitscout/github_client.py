@@ -53,6 +53,12 @@ class TokenPool:
         self._sleep = sleep
         self._rr = 0
 
+    def replace(self, tokens: Iterable[str]) -> None:
+        """Swap in fresh tokens (a GitHub App installation token that was renewed).
+        Budgets start unknown again and are learned from the next response."""
+        self.states = [TokenState(t) for t in tokens] or [TokenState(None)]
+        self._rr = 0
+
     async def acquire(self) -> TokenState:
         while True:
             now = self._clock()

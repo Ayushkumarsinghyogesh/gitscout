@@ -1,0 +1,9 @@
+{% extends "base.html" %}
+{% block title %}Invitation link{% endblock %}
+{% block content %}
+<h1>Invitation created for {{ email }}</h1>
+<p>The email could not be sent ({{ problem }}). Send this one-time link to {{ email }} yourself.
+   It works once, and only for that person. Do not post it anywhere public.</p>
+<div class="card"><code class="wrap">{{ link }}</code></div>
+<p><a href="/users">Back to users</a></p>
+{% endblock %}

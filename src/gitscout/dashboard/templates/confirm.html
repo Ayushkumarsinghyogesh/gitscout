@@ -1,0 +1,11 @@
+{% extends "base.html" %}
+{% block title %}Continue{% endblock %}
+{% block solo %}
+<h1>{{ "Accept your invitation" if kind == "invite" else "Reset your password" }}</h1>
+<p>Continue to choose a password for your GitScout account.</p>
+<form method="post" action="/auth/confirm" class="stack">
+  <input type="hidden" name="token_hash" value="{{ token_hash }}">
+  <input type="hidden" name="kind" value="{{ kind }}">
+  <button class="primary">Continue</button>
+</form>
+{% endblock %}

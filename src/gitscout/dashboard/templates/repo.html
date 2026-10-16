@@ -1,0 +1,43 @@
+{% extends "base.html" %}
+{% block title %}{{ r.repo }}{% endblock %}
+{% block content %}
+<div class="head">
+  <h1>{{ r.repo }}</h1>
+  <a class="button" href="https://github.com/{{ r.repo }}" rel="noopener noreferrer" target="_blank">Open on GitHub</a>
+</div>
+{% if r.description %}<p class="muted">{{ r.description }}</p>{% endif %}
+
+<div class="stats">
+  <div class="stat"><div class="n">{{ r.records|num }}</div><div class="l">people</div></div>
+  <div class="stat"><div class="n">{{ r.with_email|num }}</div><div class="l">with an email</div></div>
+  <div class="stat"><div class="n">{{ r.with_linkedin|num }}</div><div class="l">with LinkedIn</div></div>
+  <div class="stat"><div class="n">{{ r.last_success_at|ago }}</div><div class="l">last success</div></div>
+</div>
+
+<div class="cols">
+  <div class="card">
+    <h3>Collection</h3>
+    <p>Status: {% include "_status.html" %}</p>
+    <p>Schedule: {{ "every night at 00:00" if r.schedule_cron == "0 0 * * *" else "cron " ~ r.schedule_cron }} ({{ r.timezone }}){% if not r.enabled %}, <strong>paused</strong>{% endif %}</p>
+    <p>Next run: {{ r.next_run|ist if r.next_run else "none (paused)" }}</p>
+    <p>Collects: {{ r.collections|join(", ") }}</p>
+    <div class="row">
+      <form method="post" action="/repos/{{ r.repo }}/run"><input type="hidden" name="csrf" value="{{ csrf }}">
+        <button class="primary" {{ "disabled" if r.active_job_id }}>Run now</button></form>
+      {% if r.can_manage %}
+      <form method="post" action="/repos/{{ r.repo }}/enabled"><input type="hidden" name="csrf" value="{{ csrf }}">
+        <input type="hidden" name="enabled" value="{{ 0 if r.enabled else 1 }}">
+        <button>{{ "Pause nightly runs" if r.enabled else "Resume nightly runs" }}</button></form>
+      {% endif %}
+    </div>
+  </div>
+  <div class="card">
+    <h3>Export this repository</h3>
+    {% set repo = r.repo %}{% include "_export_form.html" %}
+  </div>
+</div>
+
+<h2>Runs</h2>
+{% if jobs %}{% include "_jobs_table.html" %}{% else %}<p class="muted">No runs yet.</p>{% endif %}
+<p><a href="/records?repo={{ r.repo }}">Browse this repository's records</a></p>
+{% endblock %}

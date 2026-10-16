@@ -1,0 +1,7 @@
+{% if r.active_job_status == "running" %}<span class="pill run">collecting now</span>
+{% elif r.active_job_status == "queued" %}<span class="pill warn">queued</span>
+{% elif not r.enabled %}<span class="pill">paused</span>
+{% elif r.last_job_status == "failed" %}<span class="pill bad" title="{{ r.last_job_error or '' }}">last run failed</span>
+{% elif not r.last_success_at %}<span class="pill warn">waiting for first run</span>
+{% elif r.overdue %}<span class="pill bad">overdue</span>
+{% else %}<span class="pill good">up to date</span>{% endif %}

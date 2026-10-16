@@ -1,0 +1,51 @@
+{% extends "base.html" %}
+{% block title %}Records{% endblock %}
+{% block content %}
+<div class="head">
+  <h1>Records</h1>
+  <a class="button" href="/exports{{ '?repo=' ~ repo if repo }}">Export CSV</a>
+</div>
+<form method="get" action="/records" class="filters">
+  <select name="repo">
+    <option value="">All my repositories</option>
+    {% for x in v.repos %}<option value="{{ x }}" {{ "selected" if x == repo }}>{{ x }}</option>{% endfor %}
+  </select>
+  <input type="search" name="q" value="{{ q }}" placeholder="Search name, username, email, company">
+  <label class="check"><input type="checkbox" name="email" value="1" {{ "checked" if email }}> with email only</label>
+  <button>Filter</button>
+</form>
+<p class="muted">{{ total|num }} people{% if repo %} in {{ repo }}{% endif %}. Newest collected first.</p>
+<div class="scroll">
+<table class="grid">
+  <thead><tr><th>Person</th><th>Email</th><th>LinkedIn</th><th>Company</th><th>Location</th>
+    <th class="r">Issues</th><th class="r">PRs</th><th class="r">Discussions</th><th class="r">Forks</th><th>Collected</th>{% if not repo %}<th>Repository</th>{% endif %}</tr></thead>
+  <tbody>
+  {% for p in rows %}
+  <tr>
+    <td><a href="/records/{{ p.repo }}/{{ p.username }}">{{ p.full_name or p.username }}</a><div class="muted small">@{{ p.username }}</div></td>
+    <td>{{ p.email or "" }}</td>
+    <td>{% if p.linkedin_url %}<a href="{{ p.linkedin_url }}" rel="noopener noreferrer" target="_blank">profile</a>{% endif %}</td>
+    <td>{{ p.company_name or "" }}</td>
+    <td>{{ p.location or "" }}</td>
+    <td class="r">{{ p.issues_count|num }}</td>
+    <td class="r">{{ p.pull_requests_count|num }}</td>
+    <td class="r">{{ p.discussions_count|num }}</td>
+    <td class="r">{{ p.forks_count|num }}</td>
+    <td>{{ p.collected_at|ist("%d %b %Y") }}</td>
+    {% if not repo %}<td>{{ p.repo }}</td>{% endif %}
+  </tr>
+  {% else %}
+  <tr><td colspan="11" class="muted">Nothing matches.</td></tr>
+  {% endfor %}
+  </tbody>
+</table>
+</div>
+{% if pages > 1 %}
+<div class="pager">
+  {% set base = "/records?repo=" ~ repo|urlencode ~ "&q=" ~ q|urlencode ~ "&email=" ~ email %}
+  {% if page_no > 1 %}<a class="button" href="{{ base }}&page_no={{ page_no - 1 }}">Previous</a>{% endif %}
+  <span>Page {{ page_no }} of {{ pages }}</span>
+  {% if page_no < pages %}<a class="button" href="{{ base }}&page_no={{ page_no + 1 }}">Next</a>{% endif %}
+</div>
+{% endif %}
+{% endblock %}

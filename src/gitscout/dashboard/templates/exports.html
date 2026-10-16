@@ -1,0 +1,21 @@
+{% extends "base.html" %}
+{% block title %}Export CSV{% endblock %}
+{% block content %}
+<h1>Export CSV</h1>
+<div class="cols">
+  <div class="card">
+    <h2>Download now</h2>
+    {% set repo = repo %}
+    {% if repo %}<p>Repository: <strong>{{ repo }}</strong> · <a href="/exports">choose another</a></p>{% endif %}
+    {% include "_export_form.html" %}
+  </div>
+  <div class="card">
+    <h2>Nightly archives</h2>
+    <p class="muted small">Every night at 02:00 IST a complete copy of each repository is saved (gzipped CSV). Copies are kept for 90 days.</p>
+    {% for a in archives %}
+      <p><a href="/exports/archive/{{ a.id }}">{{ a.repo }} · {{ a.generated_at|ist }}</a>
+         <span class="muted small">{{ a.row_count|num }} rows, {{ "%.1f"|format((a.byte_size or 0) / 1048576) }} MB</span></p>
+    {% else %}<p class="muted">No archives yet.</p>{% endfor %}
+  </div>
+</div>
+{% endblock %}

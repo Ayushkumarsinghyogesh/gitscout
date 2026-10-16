@@ -210,7 +210,8 @@ create table if not exists "Defendermate-Github1-Trivy".threads (
     participants       text[]      not null default '{}',
     node_id            text,
     comments_stored    smallint    not null default 0,       -- what we actually hold
-    comments_truncated boolean     not null default false,   -- true only while a gap remains
+    comments_truncated boolean     not null default false,
+    source_deleted_at  timestamptz,                 -- set by the weekly deletion sweep; never deleted   -- true only while a gap remains
 
     -- pull requests
     merged             boolean,
@@ -571,7 +572,7 @@ begin
         execute format('create schema %I', s);
     end if;
     execute format('revoke all on schema %I from anon, authenticated', s);
-    execute format('grant usage on schema %I to gitscout_writer', s);
+    execute format('grant usage on schema %I to gitscout_writer, gitscout_app', s);
 
     foreach t in array array['threads', 'comments', 'interactions'] loop
         if to_regclass(format('%I.%I', s, t)) is null then
@@ -581,7 +582,10 @@ begin
             execute format('alter table %I.%I enable row level security', s, t);
             execute format('create policy gitscout_writer_rw on %I.%I for all to gitscout_writer '
                            'using (true) with check (true)', s, t);
+            execute format('create policy gitscout_app_rw on %I.%I for all to gitscout_app '
+                           'using (true) with check (true)', s, t);
             execute format('grant select, insert, update on %I.%I to gitscout_writer', s, t);
+            execute format('grant select on %I.%I to gitscout_app', s, t);
         end if;
     end loop;
     -- LIKE does not copy foreign keys.
@@ -652,6 +656,177 @@ $$;
 revoke execute on function gitscout.details_for(text[], text[]) from public, anon, authenticated;
 revoke execute on function gitscout.people_in(text, text, integer) from public, anon, authenticated;
 
+-- ================================================================ platform foundation
+--
+-- Repository configuration, the durable job queue, the application's own tables and
+-- the dashboard role gitscout_app (migration 0011). The worker and the dashboard read
+-- and write these; mirrored data is never touched by them. gitscout_app is created
+-- NOLOGIN; its password is set out of band like the writer's:
+--     alter role gitscout_app login password '<generated>';
+
+-- ------------------------------------------------------------ 1. repositories
+alter table gitscout.repositories
+    add column if not exists enabled           boolean     not null default true,
+    add column if not exists collections       text[]      not null default '{issues,prs,discussions,forks,commits}',
+    add column if not exists schedule_cron     text        not null default '0 0 * * *',
+    add column if not exists timezone          text        not null default 'Asia/Kolkata',
+    add column if not exists settings          jsonb       not null default '{}'::jsonb,
+    add column if not exists checkpoint        jsonb       not null default '{}'::jsonb,
+    add column if not exists last_scheduled_at timestamptz,
+    add column if not exists last_success_at   timestamptz,
+    add column if not exists last_job_id       bigint,
+    add column if not exists added_by          uuid,
+    add column if not exists added_at          timestamptz not null default now();
+
+do $$
+begin
+    if not exists (select 1 from pg_constraint where conname = 'repositories_collections_check') then
+        alter table gitscout.repositories add constraint repositories_collections_check
+            check (collections <@ '{issues,prs,discussions,forks,commits,stars}'::text[]);
+    end if;
+    if not exists (select 1 from pg_constraint where conname = 'repositories_schedule_check') then
+        alter table gitscout.repositories add constraint repositories_schedule_check
+            check (schedule_cron ~ '^\S+ \S+ \S+ \S+ \S+$');
+    end if;
+end
+$$;
+
+comment on column gitscout.repositories.enabled is
+    'false: the scheduler skips it and the dashboard shows it paused; data stays';
+comment on column gitscout.repositories.collections is
+    'what a run collects: issues, prs, discussions, forks, commits (stars needs admin rights on the repo)';
+comment on column gitscout.repositories.schedule_cron is
+    '5-field cron (minute hour day month weekday) evaluated in `timezone`; default: every night at 00:00';
+comment on column gitscout.repositories.settings is
+    'per-repository knobs, e.g. {"max": 2000, "limit": 2000, "comments": 20}';
+comment on column gitscout.repositories.checkpoint is
+    'the worker''s last cursors and high-water marks, copied from its local store after every run, so a lost worker disk resumes instead of re-backfilling';
+comment on column gitscout.repositories.last_scheduled_at is
+    'the minute the scheduler last enqueued a run for; prevents enqueuing twice in one minute';
+
+-- ---------------------------------------------------------------------- 2. jobs
+create table if not exists gitscout.jobs (
+    id              bigserial   primary key,
+    repo            text        not null references gitscout.repositories (repo) on delete cascade,
+    kind            text        not null check (kind in ('incremental', 'full', 'backfill', 'sweep', 'export')),
+    trigger         text        not null check (trigger in ('schedule', 'manual', 'retry', 'system')),
+    requested_by    uuid,                                      -- app user, for manual runs
+    status          text        not null default 'queued'
+                                check (status in ('queued', 'running', 'succeeded', 'failed', 'cancelled')),
+    priority        smallint    not null default 100,          -- lower runs first
+    run_after       timestamptz not null default now(),
+    created_at      timestamptz not null default now(),
+    started_at      timestamptz,
+    finished_at     timestamptz,
+    heartbeat_at    timestamptz,
+    attempt         smallint    not null default 0,
+    max_attempts    smallint    not null default 3,
+    worker          text,                                      -- host/pid that ran it
+    code_version    text,                                      -- git sha of the worker
+    collections     text[]      not null default '{}',
+    counters        jsonb       not null default '{}'::jsonb,  -- {"issues": {"discovered":.., "inserted":.., "updated":.., "skipped":.., "failed":..}, ...}
+    checkpoint      jsonb       not null default '{}'::jsonb,  -- cursors at the end of the run
+    rate            jsonb       not null default '{}'::jsonb,  -- {"points_used":.., "remaining":.., "reset_at":..}
+    error           text,                                      -- sanitized: no DSN, no token
+    export_id       bigint,
+    parent_job_id   bigint      references gitscout.jobs (id) on delete set null
+);
+comment on table gitscout.jobs is
+    'the durable queue and the run history: a row is created queued, claimed by one worker, and ends succeeded, failed or cancelled';
+
+-- One queued-or-running job per (repository, kind). The second enqueue fails on this
+-- index, which is the overlap protection; everything else is bookkeeping.
+create unique index if not exists jobs_one_active_per_repo_kind
+    on gitscout.jobs (repo, kind) where status in ('queued', 'running');
+create index if not exists jobs_queue_idx
+    on gitscout.jobs (priority, run_after, id) where status = 'queued';
+create index if not exists jobs_running_idx
+    on gitscout.jobs (heartbeat_at) where status = 'running';
+create index if not exists jobs_repo_created_idx
+    on gitscout.jobs (repo, created_at desc);
+
+-- --------------------------------------------------- 3. application tables
+create table if not exists gitscout.app_users (
+    user_id       uuid        primary key,                     -- Supabase Auth user id (no FK: portable)
+    email         text        not null unique,
+    role          text        not null check (role in ('platform_admin', 'client_admin', 'client_viewer')),
+    display_name  text,
+    created_at    timestamptz not null default now(),
+    created_by    uuid,
+    disabled_at   timestamptz
+);
+comment on table gitscout.app_users is
+    'application roles. Rows are written only by the server-side admin path, never from signup metadata';
+
+create table if not exists gitscout.memberships (
+    user_id     uuid        not null references gitscout.app_users (user_id) on delete cascade,
+    repo        text        not null references gitscout.repositories (repo) on delete cascade,
+    role        text        not null check (role in ('client_admin', 'client_viewer')),
+    granted_by  uuid,
+    granted_at  timestamptz not null default now(),
+    primary key (user_id, repo)
+);
+comment on table gitscout.memberships is
+    'which repositories a client user may see; platform_admin needs no rows here';
+
+create table if not exists gitscout.audit_log (
+    id           bigserial   primary key,
+    at           timestamptz not null default now(),
+    actor_id     uuid,
+    actor_email  text,
+    action       text        not null,                         -- e.g. repo.enable, job.enqueue, record.delete
+    target_kind  text,
+    target_id    text,
+    repo         text,
+    affected     integer,
+    details      jsonb       not null default '{}'::jsonb,
+    result       text        not null default 'ok'
+);
+create index if not exists audit_log_at_idx on gitscout.audit_log (at desc);
+comment on table gitscout.audit_log is 'append-only; nobody has delete or update on it';
+
+create table if not exists gitscout.exclusions (
+    id          bigserial   primary key,
+    repo        text        not null references gitscout.repositories (repo) on delete cascade,
+    kind        text        not null check (kind in ('person', 'thread')),
+    key         text        not null,                          -- login, or '<section>/<number>'
+    reason      text,
+    created_by  uuid,
+    created_at  timestamptz not null default now(),
+    removed_at  timestamptz,
+    unique (repo, kind, key)
+);
+comment on table gitscout.exclusions is
+    'manual decisions a sync must never undo: the outreach dataset leaves these out even after the source row is re-synced';
+
+create table if not exists gitscout.exports (
+    id            bigserial   primary key,
+    repo          text        references gitscout.repositories (repo) on delete set null,
+    job_id        bigint      references gitscout.jobs (id) on delete set null,
+    format        text        not null check (format in ('csv', 'json')),
+    storage_path  text        not null,                        -- object key in the private bucket
+    row_count     integer,
+    byte_size     bigint,
+    filters       jsonb       not null default '{}'::jsonb,
+    generated_at  timestamptz not null default now(),
+    generated_by  uuid,
+    expires_at    timestamptz
+);
+create index if not exists exports_repo_generated_idx on gitscout.exports (repo, generated_at desc);
+
+create table if not exists gitscout.app_settings (
+    key         text        primary key,
+    value       jsonb       not null,
+    updated_at  timestamptz not null default now(),
+    updated_by  uuid
+);
+insert into gitscout.app_settings (key, value) values
+    ('export_retention_days', '90'::jsonb),
+    ('stale_job_minutes',     '10'::jsonb),
+    ('alert_emails',          '[]'::jsonb)
+on conflict (key) do nothing;
+
+
 -- --------------------------------------------------- the final outreach dataset
 --
 -- Lives in "Defendermate2", quoted on purpose: it matches the existing "Defendermate"
@@ -684,6 +859,10 @@ involvement as (
            t.body as description
     from gitscout.threads_all t
     where t.author is not null
+      and t.source_deleted_at is null
+      and not exists (select 1 from gitscout.exclusions e
+                       where e.repo = t.repo and e.kind = 'thread'
+                         and e.key = t.kind || '/' || t.number and e.removed_at is null)
     union all
     -- everyone else who wrote in the thread; 'commenter' < 'reviewer', so someone
     -- who did both reads as commenter, the same rule as gitscout.participation
@@ -701,6 +880,10 @@ involvement as (
     join gitscout.threads_all t
       on t.repo = c.repo and t.kind = c.kind and t.number = c.number
     where c.login is distinct from t.author
+      and t.source_deleted_at is null
+      and not exists (select 1 from gitscout.exclusions e
+                       where e.repo = t.repo and e.kind = 'thread'
+                         and e.key = t.kind || '/' || t.number and e.removed_at is null)
 ),
 -- what each person wrote in each thread: counts, and their own messages as JSON.
 -- `json`, not `jsonb`, on purpose: jsonb stores keys shortest-first; json keeps the
@@ -878,7 +1061,11 @@ left join threads_by_person t on t.repo = x.repo and t.login = x.login
 left join signals_by_person s on s.repo = x.repo and s.login = x.login
 -- people only: bots and organisations are signals about a repo, never prospects
 where coalesce(p.account_type, 'User') = 'User'
-  and p.login !~* '(\[bot\]|-bot|_bot)$';
+  and p.login !~* '(\[bot\]|-bot|_bot)$'
+  -- a person an administrator excluded stays out, whatever the next sync brings
+  and not exists (select 1 from gitscout.exclusions e
+                   where e.repo = x.repo and e.kind = 'person'
+                     and e.key = p.login and e.removed_at is null);
 
 create unique index if not exists final_outreach_users_key
     on "Defendermate2".final_outreach_users (repository_id, username);
@@ -904,14 +1091,20 @@ begin
     -- CONCURRENTLY: readers keep the previous result for the whole refresh.
     refresh materialized view concurrently "Defendermate2".final_outreach_users;
     select count(*) into total from "Defendermate2".final_outreach_users;
+    -- first time in the dataset = collected now; existing rows keep their date (0014)
+    insert into gitscout.dataset_first_collected (repo, login)
+    select repository_owner || '/' || repository_name, username
+    from "Defendermate2".final_outreach_users
+    on conflict (repo, login) do nothing;
     insert into gitscout.sync_runs (mode, people, seconds, status)
     values ('refresh', total, extract(epoch from clock_timestamp() - started), 'ok');
     return total;
 end;
 $$;
 
--- One view per registered repository: "Defendermate2"."Defendermate-Github1-<Name>-Final",
--- named after the repository's schema.
+-- Two views per registered repository, same rows:
+--   "Defendermate2"."Defendermate-Github1-<Name>-Final"   (the name in use)
+--   "Defendermate2".final_outreach_users_<slug>          (the original convention)
 create or replace function gitscout.ensure_outreach_view(repo_full text)
 returns text
 language plpgsql
@@ -922,20 +1115,28 @@ declare
     r_owner   text;
     r_name    text;
     view_name text;
+    alias_name text;
 begin
     select owner, name into r_owner, r_name
     from gitscout.repositories where repo = repo_full;
     if r_name is null then
         raise exception 'repository % is not registered (run gitscout repo-info)', repo_full;
     end if;
-    view_name := gitscout.repo_schema_name(repo_full) || '-Final';
+    view_name  := gitscout.repo_schema_name(repo_full) || '-Final';
+    alias_name := 'final_outreach_users_' || lower(regexp_replace(r_name, '[^A-Za-z0-9]+', '_', 'g'));
 
     execute format(
         'create or replace view %I.%I with (security_invoker = true) as '
         'select * from %I.final_outreach_users '
         'where repository_owner = %L and repository_name = %L',
         'Defendermate2', view_name, 'Defendermate2', r_owner, r_name);
-    execute format('revoke all on %I.%I from anon, authenticated', 'Defendermate2', view_name);
+    execute format(
+        'create or replace view %I.%I with (security_invoker = true) as select * from %I.%I',
+        'Defendermate2', alias_name, 'Defendermate2', view_name);
+    execute format('revoke all on %I.%I, %I.%I from anon, authenticated',
+                   'Defendermate2', view_name, 'Defendermate2', alias_name);
+    execute format('grant select on %I.%I, %I.%I to gitscout_app',
+                   'Defendermate2', view_name, 'Defendermate2', alias_name);
     return view_name;
 end;
 $$;
@@ -954,3 +1155,253 @@ alter default privileges in schema "Defendermate2" revoke execute on functions f
 -- The per-repository views ("Defendermate2"."Defendermate-Github1-<Name>-Final") are not
 -- created here: the push creates one for each registered repository through
 -- gitscout.ensure_outreach_view(), which needs the registry row to name it.
+
+-- ------------------------------------------------- 4. role gitscout_app (dashboard)
+--
+-- Created NOLOGIN; the password is set out of band like the writer's:
+--     alter role gitscout_app login password '<generated>';
+
+do $$
+begin
+    if not exists (select 1 from pg_roles where rolname = 'gitscout_app') then
+        create role gitscout_app nologin;
+    end if;
+end
+$$;
+
+grant usage on schema gitscout, "Defendermate2", "Defendermate-Github1-Trivy" to gitscout_app;
+grant select on all tables in schema gitscout to gitscout_app;                      -- tables and views
+grant select on all tables in schema "Defendermate-Github1-Trivy" to gitscout_app;  -- the union views are security_invoker
+grant select on "Defendermate2".final_outreach_users to gitscout_app;  -- per-repo views: ensure_outreach_view()
+grant insert, update on gitscout.jobs, gitscout.app_users, gitscout.memberships,
+                       gitscout.exclusions, gitscout.exports, gitscout.app_settings to gitscout_app;
+grant insert on gitscout.audit_log to gitscout_app;
+grant insert on gitscout.repositories to gitscout_app;
+grant update (enabled, collections, schedule_cron, timezone, settings, added_by)
+    on gitscout.repositories to gitscout_app;
+grant usage, select on all sequences in schema gitscout to gitscout_app;
+grant execute on function gitscout.ensure_repo_schema(text),
+                          gitscout.ensure_outreach_view(text) to gitscout_app;
+
+-- the worker: claims jobs, records runs, writes exports, reads decisions and settings
+grant select, insert, update on gitscout.jobs, gitscout.exports to gitscout_writer;
+grant insert on gitscout.audit_log to gitscout_writer;
+grant select on gitscout.exclusions, gitscout.app_settings, gitscout.app_users to gitscout_writer;
+grant usage, select on all sequences in schema gitscout to gitscout_writer;
+
+-- RLS on every new table, same pattern as the rest: zero policies = nobody, one
+-- policy per role that the grants above already limit.
+do $$
+declare
+    t text;
+begin
+    foreach t in array array['jobs', 'app_users', 'memberships', 'audit_log',
+                             'exclusions', 'exports', 'app_settings'] loop
+        execute format('alter table gitscout.%I enable row level security', t);
+        if not exists (select 1 from pg_policy where polrelid = format('gitscout.%I', t)::regclass
+                                                  and polname = 'gitscout_app_rw') then
+            execute format('create policy gitscout_app_rw on gitscout.%I for all to gitscout_app '
+                           'using (true) with check (true)', t);
+        end if;
+        if not exists (select 1 from pg_policy where polrelid = format('gitscout.%I', t)::regclass
+                                                  and polname = 'gitscout_writer_rw') then
+            execute format('create policy gitscout_writer_rw on gitscout.%I for all to gitscout_writer '
+                           'using (true) with check (true)', t);
+        end if;
+    end loop;
+    -- the app may read the mirror and change repository configuration
+    foreach t in array array['gitscout.repositories', 'gitscout.people', 'gitscout.person_emails',
+                             'gitscout.sync_runs', '"Defendermate-Github1-Trivy".threads',
+                             '"Defendermate-Github1-Trivy".comments',
+                             '"Defendermate-Github1-Trivy".interactions'] loop
+        if not exists (select 1 from pg_policy where polrelid = t::regclass and polname = 'gitscout_app_rw') then
+            execute format('create policy gitscout_app_rw on %s for all to gitscout_app '
+                           'using (true) with check (true)', t);
+        end if;
+    end loop;
+end
+$$;
+revoke all on gitscout.jobs, gitscout.app_users, gitscout.memberships, gitscout.audit_log,
+              gitscout.exclusions, gitscout.exports, gitscout.app_settings from anon, authenticated;
+
+-- ============================================================ observability (0013)
+-- alerts, worker liveness, run_history and repo_health views. See migrations/0013.
+
+-- ------------------------------------------------------------------- 1. alerts
+create table if not exists gitscout.alerts (
+    id          bigserial   primary key,
+    at          timestamptz not null default now(),
+    key         text        not null,                 -- e.g. job_failed:aquasecurity/trivy:incremental
+    severity    text        not null check (severity in ('info', 'warning', 'critical')),
+    repo        text,
+    job_id      bigint,
+    subject     text        not null,
+    body        text        not null default '',
+    recipients  text[]      not null default '{}',
+    channel     text        not null default 'none' check (channel in ('email', 'none')),
+    sent_at     timestamptz,
+    error       text
+);
+create index if not exists alerts_key_at_idx on gitscout.alerts (key, at desc);
+create index if not exists alerts_at_idx on gitscout.alerts (at desc);
+
+-- ------------------------------------------------------------------ 2. workers
+create table if not exists gitscout.workers (
+    name            text        primary key,          -- host:pid
+    version         text,
+    started_at      timestamptz not null default now(),
+    seen_at         timestamptz not null default now(),
+    jobs_run        integer     not null default 0,
+    current_job_id  bigint,
+    stopped_at      timestamptz
+);
+
+-- -------------------------------------------------------------------- 3. views
+create or replace view gitscout.run_history with (security_invoker = true) as
+select j.id, j.repo, j.kind, j.trigger, j.status, j.attempt, j.max_attempts, j.parent_job_id,
+       j.created_at, j.started_at, j.finished_at,
+       extract(epoch from (coalesce(j.finished_at, j.heartbeat_at) - j.started_at))::integer as seconds,
+       j.worker, j.code_version,
+       (j.counters #>> '{interactions,discovered}')::integer as interactions_new,
+       (j.counters #>> '{people,new}')::integer             as people_new,
+       (j.counters #>> '{emails,new}')::integer             as emails_new,
+       (j.counters #>> '{push,rows}')::integer              as rows_pushed,
+       (j.rate ->> 'points_used')::integer                  as points_used,
+       (j.rate ->> 'remaining')::integer                    as points_remaining,
+       split_part(j.error, E'\n', 1)                        as error
+from gitscout.jobs j;
+
+create or replace view gitscout.repo_health with (security_invoker = true) as
+with last_ok as (
+    select repo, max(id) as id from gitscout.jobs
+    where status = 'succeeded' and kind in ('incremental', 'full', 'backfill') group by repo
+), fails as (
+    select j.repo, count(*) as n from gitscout.jobs j left join last_ok o using (repo)
+    where j.status = 'failed' and j.kind in ('incremental', 'full', 'backfill')
+      and j.id > coalesce(o.id, 0) group by j.repo
+), last_job as (
+    select distinct on (repo) repo, id, kind, status, finished_at, split_part(error, E'\n', 1) as error
+    from gitscout.jobs order by repo, id desc
+), active as (
+    select distinct on (repo) repo, id, status, started_at, heartbeat_at
+    from gitscout.jobs where status in ('queued', 'running') order by repo, id
+), overdue as (
+    select coalesce((value #>> '{}')::numeric, 26) as hours
+    from gitscout.app_settings where key = 'overdue_hours'
+)
+select r.repo, r.enabled, r.schedule_cron, r.timezone, r.added_at, r.last_success_at,
+       round(extract(epoch from (now() - r.last_success_at)) / 3600.0, 1) as hours_since_success,
+       coalesce(f.n, 0)  as consecutive_failures,
+       l.id as last_job_id, l.kind as last_job_kind, l.status as last_job_status,
+       l.finished_at as last_job_finished_at, l.error as last_job_error,
+       a.id as active_job_id, a.status as active_job_status, a.heartbeat_at as active_heartbeat_at,
+       (r.enabled and coalesce(r.last_success_at, r.added_at)
+            < now() - make_interval(hours => coalesce((select hours from overdue), 26)::integer)) as overdue
+from gitscout.repositories r
+left join fails f using (repo)
+left join last_job l using (repo)
+left join active a using (repo);
+
+-- ---------------------------------------------------------------- 4. settings
+insert into gitscout.app_settings (key, value) values
+    ('alert_cooldown_minutes', '360'::jsonb),
+    ('overdue_hours',          '26'::jsonb),
+    ('rate_alert_floor',       '250'::jsonb),
+    ('worker_silent_minutes',  '15'::jsonb)
+on conflict (key) do nothing;
+
+-- ------------------------------------------------------------- 5. privileges
+grant select, insert, update on gitscout.alerts, gitscout.workers to gitscout_writer;
+grant select on gitscout.alerts, gitscout.workers to gitscout_app;
+grant select on gitscout.run_history, gitscout.repo_health to gitscout_writer, gitscout_app;
+grant usage, select on all sequences in schema gitscout to gitscout_writer, gitscout_app;
+
+do $$
+declare
+    t text;
+begin
+    foreach t in array array['alerts', 'workers'] loop
+        execute format('alter table gitscout.%I enable row level security', t);
+        if not exists (select 1 from pg_policy where polrelid = format('gitscout.%I', t)::regclass
+                                                  and polname = 'gitscout_app_rw') then
+            execute format('create policy gitscout_app_rw on gitscout.%I for all to gitscout_app '
+                           'using (true) with check (true)', t);
+        end if;
+        if not exists (select 1 from pg_policy where polrelid = format('gitscout.%I', t)::regclass
+                                                  and polname = 'gitscout_writer_rw') then
+            execute format('create policy gitscout_writer_rw on gitscout.%I for all to gitscout_writer '
+                           'using (true) with check (true)', t);
+        end if;
+    end loop;
+end
+$$;
+revoke all on gitscout.alerts, gitscout.workers, gitscout.run_history, gitscout.repo_health
+    from anon, authenticated;
+
+-- ================================================================ exports (0014)
+-- first-collected dates, export retention, the private Storage bucket. See migrations/0014.
+
+-- ---------------------------------------------------- 1. first collected dates
+create table if not exists gitscout.dataset_first_collected (
+    repo          text        not null,
+    login         text        not null,
+    collected_at  timestamptz not null default now(),
+    primary key (repo, login)
+);
+create index if not exists dataset_first_collected_at_idx
+    on gitscout.dataset_first_collected (repo, collected_at);
+
+-- export retention
+alter table gitscout.exports add column if not exists deleted_at timestamptz;
+
+-- --------------------------------------------------------- 4. storage bucket
+do $$
+begin
+    if to_regclass('storage.buckets') is not null then
+        execute $q$insert into storage.buckets (id, name, public)
+                   values ('gitscout-exports', 'gitscout-exports', false)
+                   on conflict (id) do nothing$q$;
+    end if;
+end
+$$;
+
+-- ------------------------------------------------------------- privileges
+grant select on gitscout.dataset_first_collected to gitscout_writer, gitscout_app;
+alter table gitscout.dataset_first_collected enable row level security;
+do $$
+begin
+    if not exists (select 1 from pg_policy where polrelid = 'gitscout.dataset_first_collected'::regclass
+                                              and polname = 'gitscout_app_rw') then
+        create policy gitscout_app_rw on gitscout.dataset_first_collected
+            for all to gitscout_app using (true) with check (true);
+    end if;
+    if not exists (select 1 from pg_policy where polrelid = 'gitscout.dataset_first_collected'::regclass
+                                              and polname = 'gitscout_writer_rw') then
+        create policy gitscout_writer_rw on gitscout.dataset_first_collected
+            for all to gitscout_writer using (true) with check (true);
+    end if;
+end
+$$;
+revoke all on gitscout.dataset_first_collected from anon, authenticated;
+
+-- ============================================================== dashboard (0015)
+-- membership revocation, per-user repository limit, repo_stats. See migrations/0015.
+
+alter table gitscout.memberships add column if not exists revoked_at timestamptz;
+
+insert into gitscout.app_settings (key, value) values ('max_repos_per_user', '10'::jsonb)
+on conflict (key) do nothing;
+
+create or replace view gitscout.repo_stats with (security_invoker = true) as
+select d.repository_owner || '/' || d.repository_name   as repo,
+       count(*)                                          as records,
+       count(*) filter (where d.email is not null)        as with_email,
+       count(*) filter (where d.linkedin_url is not null) as with_linkedin,
+       max(fc.collected_at)                              as newest_collected_at
+from "Defendermate2".final_outreach_users d
+left join gitscout.dataset_first_collected fc
+  on fc.repo = d.repository_owner || '/' || d.repository_name and fc.login = d.username
+group by 1;
+
+grant select on gitscout.repo_stats to gitscout_app, gitscout_writer;
+revoke all on gitscout.repo_stats from anon, authenticated;

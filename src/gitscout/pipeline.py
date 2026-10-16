@@ -15,7 +15,7 @@ from .enrich import Enricher, EnrichSummary
 from .enrich_gql import EnrichGqlSummary, GqlEnricher
 from .export import write_export
 from .github_client import GitHubClient
-from .graphql import GraphQLClient
+from .graphql import GraphQLClient, TokenRefresh
 from .ingest import IngestResult, ingest_kind, parse_repo
 from .ingest_events import ingest_stars_via_events
 from .ingest_gql import EmailScope, GqlIngestResult, IngestTotals, ingest_repos_gql
@@ -243,6 +243,7 @@ async def run_scout(
     http: httpx.AsyncClient | None = None,
     host_check: HostCheck = is_public_host,
     progress: Callable[[int, int], None] | None = None,
+    token_refresh: "TokenRefresh | None" = None,
 ) -> ScoutResult:
     """The GraphQL pipeline: the one the scheduler runs.
 
@@ -258,7 +259,8 @@ async def run_scout(
         result.run_id = store.start_run(mode, ",".join(repo_list))
         try:
             async with GraphQLClient(
-                settings.tokens, user_agent=settings.user_agent, transport=transport
+                settings.tokens, user_agent=settings.user_agent, transport=transport,
+                token_refresh=token_refresh,
             ) as client:
                 # `stars` has no working GraphQL connection any more, so it goes
                 # through the events API instead; see [ingest_events.py].

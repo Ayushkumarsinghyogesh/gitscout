@@ -253,6 +253,7 @@ MIGRATIONS: tuple[tuple[str, str, str], ...] = (
     ("threads", "closed", "INTEGER"),
     ("thread_comments", "url", "TEXT"),
     ("thread_comments", "file_path", "TEXT"),
+    ("threads", "source_deleted_at", "TEXT"),  # set by the deletion sweep; never deleted
     ("users", "linkedin_url", "TEXT"),
     ("users", "public_repos", "INTEGER"),
     ("users", "social_fetched_at", "TEXT"),
@@ -502,6 +503,81 @@ class Store:
                     _now(),
                 ),
             )
+
+    # ------------------------------------------------------- deletion sweep
+    #
+    # GitHub never tells an incremental crawl that an issue was deleted or transferred;
+    # it simply stops listing it. The sweep compares the numbers that still exist with
+    # the numbers stored and marks the difference, instead of deleting anything: the
+    # row, its comments and its history stay, the outreach dataset leaves it out.
+
+    def thread_numbers(self, repo: str, kind: str, *, include_deleted: bool = False) -> set[int]:
+        sql = "SELECT number FROM threads WHERE repo = ? AND kind = ?"
+        if not include_deleted:
+            sql += " AND source_deleted_at IS NULL"
+        return {int(r["number"]) for r in self._conn.execute(sql, (repo, kind))}
+
+    def deleted_thread_numbers(self, repo: str, kind: str) -> set[int]:
+        return {
+            int(r["number"]) for r in self._conn.execute(
+                "SELECT number FROM threads WHERE repo = ? AND kind = ? AND source_deleted_at IS NOT NULL",
+                (repo, kind),
+            )
+        }
+
+    def mark_threads_deleted(self, repo: str, kind: str, numbers: Iterable[int], at: str | None = None) -> int:
+        """Record that these threads no longer exist on GitHub. `fetched_at` moves so
+        the next push carries the change. Returns how many rows changed."""
+        nums = sorted({int(n) for n in numbers})
+        if not nums:
+            return 0
+        now = at or _now()
+        changed = 0
+        with self._conn:
+            for start in range(0, len(nums), 500):
+                chunk = nums[start:start + 500]
+                marks = ",".join("?" * len(chunk))
+                cur = self._conn.execute(
+                    f"UPDATE threads SET source_deleted_at = ?, fetched_at = ? WHERE repo = ? AND kind = ? "
+                    f"AND source_deleted_at IS NULL AND number IN ({marks})",
+                    (now, now, repo, kind, *chunk),
+                )
+                changed += cur.rowcount
+        return changed
+
+    def restore_threads(self, repo: str, kind: str, numbers: Iterable[int], at: str | None = None) -> int:
+        """A thread marked deleted that GitHub lists again (restored, transferred back)."""
+        nums = sorted({int(n) for n in numbers})
+        if not nums:
+            return 0
+        now = at or _now()
+        changed = 0
+        with self._conn:
+            for start in range(0, len(nums), 500):
+                chunk = nums[start:start + 500]
+                marks = ",".join("?" * len(chunk))
+                cur = self._conn.execute(
+                    f"UPDATE threads SET source_deleted_at = NULL, fetched_at = ? WHERE repo = ? AND kind = ? "
+                    f"AND source_deleted_at IS NOT NULL AND number IN ({marks})",
+                    (now, repo, kind, *chunk),
+                )
+                changed += cur.rowcount
+        return changed
+
+    def crawl_states(self, contains: str) -> dict[str, dict[str, Any]]:
+        """Every crawl state whose key mentions `contains` (a repository): the
+        checkpoint a worker copies to Postgres after a run and restores on a new disk."""
+        rows = self._conn.execute(
+            "SELECT key, cursor, done, high_water, total_count FROM crawl_state WHERE key LIKE ?",
+            (f"%{contains}%",),
+        ).fetchall()
+        return {
+            r["key"]: {
+                "cursor": r["cursor"], "done": bool(r["done"]),
+                "high_water": r["high_water"], "total_count": r["total_count"],
+            }
+            for r in rows
+        }
 
     def clear_crawl_state(self, key: str) -> None:
         with self._conn:
